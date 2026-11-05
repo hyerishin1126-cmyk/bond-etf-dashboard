@@ -8,9 +8,9 @@
     4) 한국 지수 ETF (KODEX 200, TIGER 200, KODEX 코스닥150, KODEX 200TR, TIGER 미국S&P500, TIGER 미국나스닥100)
     5) 대체 및 현금성 자산 (Gold GLDM, KODEX 단기채권, 은대 2.53%)
 - 기간 조회:
-    - 2025년 1월 1일 이후 ~ 현재
-    - 최근 1개월, 3개월, 6개월, YTD 등 짧은 기간(단기 모니터링) 즉시 조회 지원
-    - 2015년~10년 장기 백테스팅 및 직접 사용자 지정 날짜 지원
+    - 기준 시작일: 2023-11-14 (KODEX 국고채10년액티브 471230 상장일) — 이전 날짜는 선택 불가
+    - 프리셋: 상장 이후 전체 / 최근 2년 / 최근 1년 / 연초 이후(YTD) / 사용자 직접 지정
+    - 1년 미만 구간은 단기 모니터링 모드(기간 누적 수익률 중심)로 자동 전환
 - 투자비중:
     - 미국 국고채 0~100%
     - 한국 국고채 0~100%
@@ -23,6 +23,24 @@
     - 지수 ETF 0~3%대 (10% × 0~30%)
     - 환차익 3~5%대 (USD/KRW 환오픈 기대)
     - 공모주 0~1%대 (연 0~1%p 가산)
+
+정확도 개선 (v2)
+-----------------------------------------------------
+① TAA 시차 보정: RSI 신호는 '알 수 있는 시점' 이후 다음 영업일 수익률부터 적용
+   (한국 영업일 기준이면 미국 종가는 다음 한국 영업일에야 확인 가능하므로 1영업일 추가 지연)
+② 단일 기준 캘린더 + 달력일 기준 연환산:
+   - 한국 종목이 있으면 '한국 영업일', 없으면 '미국 영업일'을 기준 캘린더로 사용
+     (다른 시장 가격은 직전 종가로 as-of 정렬 → 휴장일 0% 수익률 왜곡 제거)
+   - 은대 이자·공모주 Alpha·무위험수익률은 실제 경과 달력일(dt/365)로 일할
+   - 변동성·샤프의 연환산 계수는 실제 관측 빈도(연간 영업일 수)로 산출
+④ 환헤지 비용 반영: 헤지 부분에 (원화 단기금리 − 달러 단기금리) × dt/365 의 금리차(carry) 반영
+   - 자동: 달러 ^IRX(미 T-bill 3M), 원화 FRED IR3TIB01KRM156N(한국 3M 금리) / 실패 시 수동값
+⑤ 성과 기여도 분해: 일별 기여도 × 직전 NAV 가중으로 연결(linking) → 항목 합계 = 총 수익률 정확히 일치
+   - 금·현금성, 환헤지 손익(carry) 항목 추가, 단기/장기 단위 통일
+⑥ 총수익(Total Return) 데이터: 분할 반영 종가 + 분배금 재투자로 직접 산출
+   - 한국 ETF 분배금 CSV 업로드 시 업로드 값을 우선 사용 (yfinance 누락 보완)
+   - 데이터 품질 점검표(분배금 건수·분배수익률·누락 의심 경고) 제공
+(부수 수정) NAV에 기준일(=100)을 포함하여 첫 영업일 수익률이 누락되지 않도록 수정
 """
 
 import streamlit as st
@@ -30,6 +48,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
+import requests
 from datetime import date, timedelta
 import io
 import warnings
@@ -128,6 +147,87 @@ CASH_OPTS = {
     "BANK_DEPOSIT": "은대 (고정 연 2.53% 일할)",
 }
 
+# 국내상장이지만 기초자산이 달러 자산이라 원화 가격에 환율 효과가 섞여 있는 ETF
+KR_LISTED_US_FX = {"360750.KS", "133690.KS", "379800.KS"}
+
+ALL_NAMES = {**US_BOND, **KR_BOND, **US_EQUITY, **KR_EQUITY, **CASH_OPTS,
+             "GLDM": "SPDR Gold MiniShares", "SPY": US_EQUITY["SPY"]}
+
+# ── 분석 기간 기준일 ──
+# 기본 편입 종목 KODEX 국고채10년액티브(471230)의 상장일. 이 날짜 이전은 선택할 수 없다.
+LISTING_DATE = date(2023, 11, 14)
+LISTING_LABEL = "KODEX 국고채10년액티브(471230)"
+LATE_LISTING_GRACE_DAYS = 7   # 연휴 등으로 첫 거래일이 밀리는 정도는 '늦은 상장'으로 보지 않음
+
+PRESET_SINCE_LISTING = f"상장 이후 전체 ({LISTING_DATE:%Y-%m-%d} ~ 현재)"
+PRESET_2Y = "최근 2년"
+PRESET_1Y = "최근 1년"
+PRESET_YTD = "연초 이후 (YTD)"
+PRESET_CUSTOM = "사용자 직접 지정"
+PERIOD_PRESETS = [PRESET_SINCE_LISTING, PRESET_2Y, PRESET_1Y, PRESET_YTD, PRESET_CUSTOM]
+
+
+def clamp_period_date(d: date, today: date) -> date:
+    """선택 가능한 범위 [LISTING_DATE, today] 안으로 보정."""
+    return min(max(d, LISTING_DATE), today)
+
+
+def preset_date_range(preset: str, today: date) -> tuple[date, date] | None:
+    """프리셋별 (시작일, 종료일). '사용자 직접 지정'은 None (현재 선택값 유지)."""
+    if preset == PRESET_SINCE_LISTING:
+        start = LISTING_DATE
+    elif preset == PRESET_2Y:
+        start = today - timedelta(days=730)
+    elif preset == PRESET_1Y:
+        start = today - timedelta(days=365)
+    elif preset == PRESET_YTD:
+        start = date(today.year, 1, 1)
+    else:
+        return None
+    return clamp_period_date(start, today), today
+
+
+def yearly_labels(years: pd.Index, start: pd.Timestamp, end: pd.Timestamp) -> tuple[list[str], list[str]]:
+    """
+    연도별 수익률 표의 행 이름과 행별 비고 (전체 연도면 빈 문자열).
+    - 첫 해가 연중에 시작하면 '2023년* (상장 이후)'처럼 표시 (해당 구간의 기간 수익률)
+    - 마지막 해가 연중에 끝나면 '2026년† (YTD)'로 표시
+    """
+    labels, notes = [], []
+    listing_ts = pd.Timestamp(LISTING_DATE)
+    for yr in years:
+        yr = int(yr)
+        first_partial = yr == start.year and start > pd.Timestamp(yr, 1, 1) + pd.Timedelta(days=LATE_LISTING_GRACE_DAYS)
+        last_partial = yr == end.year and end < pd.Timestamp(yr, 12, 24)
+        if first_partial:
+            near_listing = abs((start - listing_ts).days) <= LATE_LISTING_GRACE_DAYS
+            tag = "상장 이후" if near_listing else f"{start:%m-%d} 이후"
+            labels.append(f"{yr}년* ({tag})")
+            year_end = min(end, pd.Timestamp(yr, 12, 31))
+            notes.append(f"* {yr}년은 전체 연도가 아닌 {start:%Y-%m-%d} ~ {year_end:%Y-%m-%d} 구간의 기간 수익률입니다.")
+        elif last_partial:
+            labels.append(f"{yr}년† (YTD)")
+            notes.append(f"† {yr}년은 {yr}-01-01 ~ {end:%Y-%m-%d} 구간의 기간 수익률입니다.")
+        else:
+            labels.append(f"{yr}년")
+            notes.append("")
+    return labels, notes
+
+
+BANK_RATE = 0.0253          # 은대 연 금리
+DAY_COUNT = 365.0           # 이자 일할 기준 (원화 관행 ACT/365)
+RF_ANNUAL = 0.03            # 샤프 지수 무위험수익률
+ASOF_TOLERANCE = pd.Timedelta(days=10)   # 다른 시장 종가를 가져올 때 허용하는 최대 공백
+
+# 자동 금리 소스
+FRED_KRW_3M = "IR3TIB01KRM156N"   # 한국 3개월 금리 (OECD, 월별)
+FRED_USD_3M = "DTB3"              # 미 T-bill 3개월 (일별) — ^IRX 실패 시 대체
+
+
+def is_kr_ticker(t: str) -> bool:
+    return t.endswith(".KS") or t.endswith(".KQ")
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  AUTHENTICATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -157,32 +257,195 @@ def show_login():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DATA FETCHING (캐싱 1시간)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@st.cache_data(ttl=3600, show_spinner="📡 실시간 금융 데이터 로딩 중...")
-def fetch_prices(tickers: tuple, start: str, end: str) -> pd.DataFrame:
-    """yfinance Adjusted Close 일봉 다운로드."""
-    if not tickers:
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_raw(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """
+    분할만 반영된 종가(close)와 분배금(div)을 함께 다운로드.
+    배당 재투자는 build_total_return()에서 직접 계산한다.
+    (yfinance end는 미포함이므로 +1일)
+    """
+    end_incl = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        df = yf.Ticker(ticker).history(
+            start=start, end=end_incl, auto_adjust=False, actions=True,
+        )
+    except Exception:
         return pd.DataFrame()
-    all_data: dict[str, pd.Series] = {}
-    for ticker in tickers:
+    if df is None or df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=df.index)
+    out["close"] = pd.to_numeric(df["Close"], errors="coerce").astype("float64")
+    if "Dividends" in df.columns:
+        out["div"] = pd.to_numeric(df["Dividends"], errors="coerce").fillna(0.0).astype("float64")
+    else:
+        out["div"] = 0.0
+
+    idx = pd.DatetimeIndex(out.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)        # 각 거래소 현지 날짜 유지
+    out.index = idx.normalize()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out = out[out["close"] > 0].dropna(subset=["close"])
+    return out
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def fetch_fred_series(series_id: str) -> pd.Series:
+    """FRED 공개 CSV (API 키 불필요). 실패 시 빈 Series."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        s = pd.to_numeric(df.iloc[:, -1], errors="coerce")
+        s.index = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        s = s[s.index.notna()].dropna().sort_index()
+        return s.astype("float64")
+    except Exception:
+        return pd.Series(dtype="float64")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ⑥ TOTAL RETURN (분배금 재투자) & 분배금 CSV
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIST_TEMPLATE_CSV = (
+    "종목코드,배당락일,분배금\n"
+    "114260,2025-01-31,000\n"
+    "471230,2025-04-30,000\n"
+)
+
+
+def _normalize_ticker(code: str) -> str:
+    code = str(code).strip().upper()
+    if "." in code:
+        return code
+    digits = "".join(ch for ch in code if ch.isalnum())
+    if digits.isdigit():
+        return digits.zfill(6) + ".KS"
+    return digits
+
+
+def parse_distribution_csv(file) -> tuple[dict[str, pd.Series], str]:
+    """
+    분배금 CSV 파싱.
+    - 종목코드 컬럼: 종목코드 / ticker / code
+    - 날짜 컬럼:   배당락일 / ex_date / date / 날짜  → 해당일(휴장이면 다음 영업일)에 반영
+                  지급기준일 / 기준일 / record_date → 직전 영업일(배당락일)에 반영
+    - 금액 컬럼:   분배금 / 분배금액 / amount / dividend (1좌당 원)
+    반환: ({ticker: Series(date → 금액, 'record' 여부는 attrs)}, 메시지)
+    """
+    try:
+        df = pd.read_csv(file, dtype=str, encoding="utf-8-sig")
+    except Exception:
         try:
-            df = yf.download(
-                ticker, start=start, end=end,
-                auto_adjust=True, progress=False,
-            )
-            if df.empty:
-                continue
-            col = df["Close"].squeeze()
-            if isinstance(col, pd.DataFrame):
-                col = col.iloc[:, 0]
-            all_data[ticker] = col
-        except Exception:
-            continue
-    if not all_data:
-        return pd.DataFrame()
-    result = pd.DataFrame(all_data)
-    if result.index.tz is not None:
-        result.index = result.index.tz_localize(None)
-    return result.astype("float32")
+            file.seek(0)
+            df = pd.read_csv(file, dtype=str, encoding="cp949")
+        except Exception as e:
+            return {}, f"CSV를 읽을 수 없습니다: {e}"
+
+    cols = {c.strip().lower(): c for c in df.columns}
+
+    def pick(cands):
+        for c in cands:
+            if c in cols:
+                return cols[c]
+        return None
+
+    c_tk = pick(["종목코드", "ticker", "code", "종목"])
+    c_ex = pick(["배당락일", "ex_date", "exdate", "date", "날짜"])
+    c_rec = pick(["지급기준일", "기준일", "record_date"])
+    c_amt = pick(["분배금", "분배금액", "amount", "dividend", "dps"])
+    c_dt = c_ex or c_rec
+    if not (c_tk and c_dt and c_amt):
+        return {}, "필수 컬럼(종목코드, 배당락일 또는 지급기준일, 분배금)을 찾지 못했습니다."
+
+    is_record = c_ex is None
+    d = pd.DataFrame({
+        "ticker": df[c_tk].map(_normalize_ticker),
+        "date": pd.to_datetime(df[c_dt], errors="coerce"),
+        "amt": pd.to_numeric(df[c_amt].astype(str).str.replace(",", ""), errors="coerce"),
+    }).dropna()
+    d = d[d["amt"] > 0]
+
+    out: dict[str, pd.Series] = {}
+    for tk, g in d.groupby("ticker"):
+        s = g.groupby("date")["amt"].sum().sort_index()
+        s.attrs["is_record_date"] = is_record
+        out[tk] = s
+    kind = "지급기준일(→직전 영업일 배당락 처리)" if is_record else "배당락일"
+    return out, f"{len(out)}개 종목, {len(d)}건 로드 ({kind} 기준)"
+
+
+def build_total_return(raw: pd.DataFrame, override: pd.Series | None = None) -> tuple[pd.Series, pd.Series]:
+    """
+    총수익 지수 = 100 × Π (P_t + D_t) / P_{t-1}
+    override(분배금 CSV)가 있으면 yfinance 분배금 대신 사용.
+    반환: (TR 지수, 영업일 기준 분배금 Series)
+    """
+    close = raw["close"]
+    if override is not None and len(override) > 0:
+        div = pd.Series(0.0, index=close.index)
+        is_record = bool(override.attrs.get("is_record_date", False))
+        for d, amt in override.items():
+            if is_record:
+                pos = close.index.searchsorted(pd.Timestamp(d), side="left") - 1   # 기준일 직전 영업일
+            else:
+                pos = close.index.searchsorted(pd.Timestamp(d), side="left")       # 당일 또는 다음 영업일
+            if 0 < pos < len(close):
+                div.iloc[pos] += float(amt)
+    else:
+        div = raw["div"].fillna(0.0)
+
+    gross = (close + div) / close.shift(1)
+    gross.iloc[0] = 1.0
+    tr = 100.0 * gross.cumprod()
+    return tr.astype("float64"), div
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ④ 금리 (헤지 carry)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _asof(s: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    s = s.sort_index()
+    out = s.reindex(index, method="ffill")
+    return out.bfill().ffill()
+
+
+def get_rate_series(index: pd.DatetimeIndex, mode: str,
+                    manual_kr: float, manual_us: float) -> tuple[pd.Series, pd.Series, str]:
+    """원화·달러 단기금리(연 %)를 index 위에 as-of 정렬. 실패 시 수동값."""
+    notes = []
+    kr = us = None
+    if mode == "자동":
+        start = (index[0] - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+        end = index[-1].strftime("%Y-%m-%d")
+        irx = fetch_raw("^IRX", start, end)
+        if not irx.empty:
+            us = irx["close"]
+            notes.append("USD 3M: ^IRX(미 T-bill 13주)")
+        else:
+            fr = fetch_fred_series(FRED_USD_3M)
+            if not fr.empty:
+                us = fr
+                notes.append(f"USD 3M: FRED {FRED_USD_3M}")
+        k = fetch_fred_series(FRED_KRW_3M)
+        if not k.empty:
+            kr = k
+            lag_days = (index[-1] - k.index[-1]).days
+            stale = f", 최근 {lag_days}일은 마지막 월값 유지" if lag_days > 45 else ""
+            notes.append(f"KRW 3M: FRED {FRED_KRW_3M}(월별{stale})")
+
+    if us is None:
+        us = pd.Series(manual_us, index=index)
+        notes.append(f"USD: 수동 {manual_us:.2f}%")
+    if kr is None:
+        kr = pd.Series(manual_kr, index=index)
+        notes.append(f"KRW: 수동 {manual_kr:.2f}%")
+    if mode == "자동" and any("수동" in n for n in notes):
+        notes.append("⚠️ 자동 조회 일부 실패 → 수동값 대체")
+    return _asof(kr, index), _asof(us, index), " · ".join(notes)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  FINANCIAL METRICS (장기 및 단기 구간 정밀 산출)
@@ -219,22 +482,34 @@ def calc_mdd(nav: pd.Series) -> float:
     dd = (nav - peak) / peak
     return float(dd.min()) * 100
 
-def calc_volatility(returns: pd.Series) -> float:
+def calc_periods_per_year(index: pd.DatetimeIndex) -> float:
+    """실제 관측 빈도(연간 영업일 수). 3개월 미만 구간은 표본이 적어 252로 고정."""
+    n = len(index) - 1
+    days = (index[-1] - index[0]).days if len(index) > 1 else 0
+    if n <= 0 or days < 90:
+        return 252.0
+    return n / (days / 365.25)
+
+def calc_volatility(returns: pd.Series, periods_per_year: float = 252.0) -> float:
     """연환산 변동성 (%)."""
     if len(returns) < 2:
         return 0.0
-    return float(returns.std() * np.sqrt(252) * 100)
+    return float(returns.std() * np.sqrt(periods_per_year) * 100)
 
-def calc_sharpe(returns: pd.Series, rf_annual: float = 0.03) -> float:
-    """샤프 지수 (연환산, 무위험 3.0% 가정)."""
+def calc_sharpe(returns: pd.Series, dt_days: pd.Series | None = None,
+                periods_per_year: float = 252.0, rf_annual: float = RF_ANNUAL) -> float:
+    """샤프 지수 (연환산). 무위험수익률은 실제 경과 달력일로 일할."""
     if len(returns) < 2:
         return 0.0
-    rf_daily = (1 + rf_annual) ** (1 / 252) - 1
-    excess = returns - rf_daily
+    if dt_days is None:
+        rf = (1 + rf_annual) ** (1 / periods_per_year) - 1
+    else:
+        rf = (1 + rf_annual) ** (dt_days.reindex(returns.index).fillna(1.0) / DAY_COUNT) - 1
+    excess = returns - rf
     std = excess.std()
     if std == 0 or np.isnan(std):
         return 0.0
-    return float((excess.mean() / std) * np.sqrt(252))
+    return float((excess.mean() / std) * np.sqrt(periods_per_year))
 
 def calc_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
     """Wilder RSI 계산 (데이터 부족 시 결측값 안전 처리)."""
@@ -273,8 +548,8 @@ def compute_rsi_signal(
     exit_threshold: int = 60,
     max_days: int = 20,
 ) -> pd.Series:
-    """RSI 과매도 진입/탈출 시그널 (1=진입, 0=미진입)."""
-    signal = np.zeros(len(rsi), dtype="float32")
+    """RSI 과매도 진입/탈출 시그널 (1=진입, 0=미진입). 값은 '해당일 종가 시점'에 확정."""
+    signal = np.zeros(len(rsi), dtype="float64")
     in_pos = False
     held = 0
     for i in range(len(rsi)):
@@ -293,6 +568,20 @@ def compute_rsi_signal(
             else:
                 signal[i] = 1
     return pd.Series(signal, index=rsi.index)
+
+def align_signal_no_lookahead(sig_native: pd.Series, price_index: pd.DatetimeIndex,
+                              native_is_us: bool, calendar_is_kr: bool) -> pd.Series:
+    """
+    ① 시차 보정.
+    sig_native[d] 는 d일 종가 시점에 확정된다.
+    - 미국 신호를 한국 캘린더에 쓰는 경우: 미국 d일 종가는 한국 d+1일 아침에 확인 → 가용일 +1일
+    - 반환값은 '수익률 행(t)'에 적용할 신호: t-1 시점(직전 종가)까지 확인 가능한 신호
+    """
+    s = sig_native.copy()
+    if native_is_us and calendar_is_kr:
+        s.index = s.index + pd.Timedelta(days=1)
+    avail = s.reindex(price_index, method="ffill").fillna(0.0)
+    return avail.shift(1).iloc[1:].fillna(0.0)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  WEIGHT ALLOCATION LOGIC
@@ -341,7 +630,7 @@ def _calc_weights(params: dict, available: list[str]) -> tuple[dict[str, float],
 
     gold_on = params["gold_enabled"] and "GLDM" in available
     cash_tk = params["cash_ticker"]
-    cash_ok = cash_tk and (cash_tk in available or cash_tk == "BANK_DEPOSIT")
+    cash_ok = cash_tk and cash_tk in available
 
     if c_alt > 0:
         if gold_on and cash_ok:
@@ -369,149 +658,232 @@ def _calc_weights(params: dict, available: list[str]) -> tuple[dict[str, float],
 #  BACKTEST ENGINE & ATTRIBUTION BREAKDOWN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def run_backtest(params: dict) -> dict | None:
-    portfolio_tickers: list[str] = []
-    us_tickers: list[str] = []
-    kr_tickers: list[str] = []
+    start_ts = pd.Timestamp(params["start_date"])
+    end_ts = pd.Timestamp(params["end_date"])
+    s_str, e_str = start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d")
 
+    # ── 0. 편입 후보 (비중 0% 자산군은 공통 구간을 줄이지 않도록 제외) ──
+    w_raw = {
+        "us_bond": params["weight_us_bond"], "kr_bond": params["weight_kr_bond"],
+        "us_eq": params["weight_us_eq"], "kr_eq": params["weight_kr_eq"],
+        "alt": params["weight_alt_cash"],
+    }
+    if not params["us_bonds"]:
+        w_raw["kr_bond"] += w_raw["us_bond"]       # _calc_weights의 미국채→한국채 이전 규칙과 동일
+
+    group: dict[str, str] = {}      # ticker → 기여도 버킷 (bond / equity / alt)
     for t in params["us_bonds"]:
-        portfolio_tickers.append(t); us_tickers.append(t)
+        if w_raw["us_bond"] > 0: group[t] = "bond"
     for t in params["kr_bonds"]:
-        portfolio_tickers.append(t); kr_tickers.append(t)
+        if w_raw["kr_bond"] > 0: group[t] = "bond"
     for t in params["us_equity"]:
-        portfolio_tickers.append(t); us_tickers.append(t)
+        if w_raw["us_eq"] > 0: group[t] = "equity"
     for t in params["kr_equity"]:
-        portfolio_tickers.append(t); kr_tickers.append(t)
-    if params["gold_enabled"]:
-        portfolio_tickers.append("GLDM"); us_tickers.append("GLDM")
-
-    cash_tk = params["cash_ticker"]
-    if cash_tk and cash_tk != "BANK_DEPOSIT":
-        portfolio_tickers.append(cash_tk); kr_tickers.append(cash_tk)
-
-    fetch_list = list(set(portfolio_tickers + ["SPY", "KRW=X"]))
-
-    # 1. 시세 데이터 수집
-    prices = fetch_prices(
-        tuple(sorted(fetch_list)),
-        str(params["start_date"]),
-        str(params["end_date"]),
-    )
-    if prices.empty:
-        st.error("❌ 시세 데이터를 불러올 수 없습니다. 날짜와 종목을 확인하세요.")
+        if w_raw["kr_eq"] > 0: group[t] = "equity"
+    if w_raw["alt"] > 0:
+        if params["gold_enabled"]:
+            group["GLDM"] = "alt"
+        if params["cash_ticker"]:
+            group[params["cash_ticker"]] = "alt"
+    if not group:
+        st.error("❌ 비중이 0%보다 큰 자산군에서 최소 하나의 종목을 선택하세요.")
         return None
 
-    available_pt = [t for t in portfolio_tickers if t in prices.columns]
-    missing = [t for t in portfolio_tickers if t not in prices.columns]
+    us_set = set(params["us_bonds"]) | set(params["us_equity"]) | {"GLDM"}
+    market_tk = [t for t in group if t != "BANK_DEPOSIT"]
+
+    # ── 1. 시세 + 분배금 수집 (⑥ 총수익 직접 산출) ──
+    raw: dict[str, pd.DataFrame] = {}
+    for t in sorted(set(market_tk + ["SPY"])):
+        df = fetch_raw(t, s_str, e_str)
+        if not df.empty:
+            raw[t] = df
+
+    missing = [t for t in market_tk if t not in raw]
     if missing:
         st.warning(f"⚠️ 다음 종목 데이터 부재로 제외: {', '.join(missing)}")
-    if not available_pt:
+    avail_mkt = [t for t in market_tk if t in raw]
+    pt = avail_mkt + (["BANK_DEPOSIT"] if "BANK_DEPOSIT" in group else [])
+    if not pt:
         st.error("❌ 유효한 포트폴리오 종목이 존재하지 않습니다.")
         return None
 
-    portfolio_tickers = available_pt
-    us_tickers = [t for t in us_tickers if t in available_pt]
-    kr_tickers = [t for t in kr_tickers if t in available_pt]
+    dist_override: dict[str, pd.Series] = params.get("dist_override") or {}
+    tr: dict[str, pd.Series] = {}
+    divs: dict[str, pd.Series] = {}
+    for t, df in raw.items():
+        tr[t], divs[t] = build_total_return(df, dist_override.get(t))
 
-    # 2. 환율 데이터
-    has_fx = "KRW=X" in prices.columns and not prices["KRW=X"].isna().all()
-    fx_raw = prices["KRW=X"].copy() if has_fx else None
+    # ── 2. 기준 캘린더 (② 한국 종목이 있으면 한국 영업일) ──
+    kr_mkt = [t for t in avail_mkt if is_kr_ticker(t)]
+    calendar_is_kr = bool(kr_mkt)
+    ref = kr_mkt if calendar_is_kr else (avail_mkt or ["SPY"])
+    ref = [t for t in ref if t in raw]
+    if not ref:
+        st.error("❌ 기준 캘린더를 만들 시세가 없습니다.")
+        return None
+    cal = raw[ref[0]].index
+    for t in ref[1:]:
+        cal = cal.union(raw[t].index)
+    cal = cal[(cal >= start_ts) & (cal <= end_ts)]
+    calendar_label = "한국 영업일" if calendar_is_kr else "미국 영업일"
 
-    # 3. 은대 합성 데이터 생성
-    cols_needed = list(set(portfolio_tickers + (["SPY"] if "SPY" in prices.columns else [])))
-    asset_prices = prices[cols_needed].copy()
-    if cash_tk == "BANK_DEPOSIT":
-        n = len(asset_prices)
-        daily_rate = (1 + 0.0253) ** (1 / 252) - 1
-        bank_nav = 100.0 * (1 + daily_rate) ** np.arange(n)
-        asset_prices["BANK_DEPOSIT"] = bank_nav.astype("float32")
-        portfolio_tickers.append("BANK_DEPOSIT")
-        kr_tickers.append("BANK_DEPOSIT")
+    cols = list(dict.fromkeys(avail_mkt + (["SPY"] if "SPY" in tr else [])))
+    prices = pd.DataFrame(
+        {t: tr[t].reindex(cal, method="ffill", tolerance=ASOF_TOLERANCE) for t in cols},
+        index=cal,
+    )
+    # 상장 전 구간이 ffill로 채워지지 않도록: 원시 데이터 첫날 이전은 NaN 유지
+    for t in cols:
+        prices.loc[prices.index < tr[t].index[0], t] = np.nan
 
-    # 4. 공통 데이터 구간 정렬
-    asset_prices = asset_prices.ffill(limit=5)
-    first_valid = asset_prices.apply(lambda s: s.first_valid_index()).max()
-    last_valid  = asset_prices.apply(lambda s: s.last_valid_index()).min()
-    if first_valid is None or last_valid is None or first_valid >= last_valid:
+    first_valid = max(prices[c].first_valid_index() or pd.Timestamp.max for c in cols)
+    last_valid = min(prices[c].last_valid_index() or pd.Timestamp.min for c in cols)
+    if first_valid >= last_valid:
         st.error("❌ 선택한 기간의 거래일 데이터가 부족합니다 (최소 2일 이상 필요).")
         return None
-    asset_prices = asset_prices.loc[first_valid:last_valid].dropna()
-
-    if len(asset_prices) < 2:
+    prices = prices.loc[first_valid:last_valid].dropna()
+    if len(prices) < 2:
         st.error("❌ 분석에 필요한 유효 거래일 데이터가 2일 미만입니다. 기간을 조금 더 넓혀주세요.")
         return None
 
-    if has_fx:
-        fx_raw = fx_raw.reindex(asset_prices.index).ffill().bfill()
-        fx_returns = fx_raw.pct_change().fillna(0)
-    else:
-        fx_returns = pd.Series(0.0, index=asset_prices.index, dtype="float32")
+    # 구간 축소 알림: 선택한 시작일 이후 '늦게 상장된' 종목 때문에 공통 시작일이 밀린 경우에만 노출.
+    # (시작일이 휴장일이라 첫 거래일이 하루이틀 밀리는 정상 케이스에서는 띄우지 않음)
+    market_first: dict[str, pd.Timestamp] = {}
+    for t, df in raw.items():
+        mk = "KR" if is_kr_ticker(t) else "US"
+        d_in = df.index[df.index >= start_ts]
+        if len(d_in):
+            market_first[mk] = min(market_first.get(mk, d_in[0]), d_in[0])
+    late_listed: list[tuple[str, pd.Timestamp]] = []
+    for t in avail_mkt:
+        d_in = raw[t].index[raw[t].index >= start_ts]
+        if not len(d_in):
+            continue
+        own_first = d_in[0]
+        mk = "KR" if is_kr_ticker(t) else "US"
+        # 같은 시장 다른 종목보다 3일 넘게 늦게 시작 (하루짜리 데이터 결측은 무시)
+        later_than_peers = (own_first - market_first.get(mk, own_first)).days > 3
+        beyond_holiday_gap = (own_first - start_ts).days > LATE_LISTING_GRACE_DAYS
+        if later_than_peers or beyond_holiday_gap:
+            late_listed.append((t, own_first))
 
-    user_start = pd.Timestamp(params["start_date"])
-    if first_valid > user_start:
+    if late_listed and first_valid > start_ts:
+        late_txt = ", ".join(
+            f"{t.replace('.KS', '')}({ALL_NAMES.get(t, t)}, 첫 거래 {d:%Y-%m-%d})" for t, d in late_listed
+        )
         st.info(
-            f"ℹ️ ETF 상장일 제한으로 실제 공통 백테스팅 구간: "
-            f"**{first_valid.strftime('%Y-%m-%d')}** ~ **{last_valid.strftime('%Y-%m-%d')}**"
+            f"ℹ️ 선택한 시작일({start_ts:%Y-%m-%d}) 이후 상장된 종목이 있어 실제 공통 백테스팅 구간이 "
+            f"**{first_valid:%Y-%m-%d}** ~ **{last_valid:%Y-%m-%d}** 로 조정되었습니다. "
+            f"원인 종목: {late_txt}"
         )
 
-    # 5. 일별 수익률 계산
-    returns = asset_prices.pct_change().iloc[1:]
-    if returns.empty:
-        st.error("❌ 일별 수익률을 계산할 수 없습니다. 더 긴 기간을 선택하세요.")
-        return None
+    # 은대: 실제 경과 달력일로 일할 (② 252 가정 제거)
+    if "BANK_DEPOSIT" in pt:
+        elapsed = (prices.index - prices.index[0]).days.to_numpy(dtype="float64")
+        prices["BANK_DEPOSIT"] = 100.0 * (1 + BANK_RATE) ** (elapsed / DAY_COUNT)
 
-    fx_ret = fx_returns.reindex(returns.index).fillna(0)
-    hedge_ratio = params["hedge_ratio"] / 100.0
+    idx = prices.index
+    dt = pd.Series(np.diff(idx.values).astype("timedelta64[D]").astype("float64"),
+                   index=idx[1:], name="dt_days")
+    periods_per_year = calc_periods_per_year(idx)
 
-    # 환오픈 (원화 환산) 수익률
-    ret_open = returns.copy()
-    for t in us_tickers:
-        if t in ret_open.columns:
-            ret_open[t] = (1 + returns[t]) * (1 + fx_ret * (1 - hedge_ratio)) - 1
-
-    # 완전 환헤지 수익률
-    ret_hedged = returns.copy()
-
-    # 벤치마크: SPY 원화 환산
-    if "SPY" in returns.columns:
-        bench_open = (1 + returns["SPY"]) * (1 + fx_ret) - 1
+    # ── 3. 환율 ──
+    fx_df = fetch_raw("KRW=X", (first_valid - pd.Timedelta(days=15)).strftime("%Y-%m-%d"), e_str)
+    has_fx = not fx_df.empty
+    if has_fx:
+        fx_lvl = fx_df["close"].reindex(idx, method="ffill", tolerance=ASOF_TOLERANCE).ffill().bfill()
+        fx_ret = fx_lvl.pct_change().iloc[1:].fillna(0.0)
     else:
-        bench_open = pd.Series(0.0, index=returns.index)
+        st.warning("⚠️ USD/KRW 환율을 불러오지 못해 환율 변동을 0으로 처리합니다.")
+        fx_ret = pd.Series(0.0, index=idx[1:])
 
-    # 6. 비중 산출
-    weights, cat_weights = _calc_weights(params, portfolio_tickers)
+    # ── 4. 헤지 carry (④) ──
+    has_us = any(t in us_set for t in pt)
+    if has_us:
+        kr_rate, us_rate, rate_note = get_rate_series(
+            idx, params["hedge_cost_mode"], params["manual_kr_rate"], params["manual_us_rate"],
+        )
+        # 구간 (t-1, t] 의 carry는 t-1 시점 금리 적용
+        diff_prev = ((kr_rate - us_rate) / 100.0).shift(1).iloc[1:]
+        carry = diff_prev * dt / DAY_COUNT
+        avg_carry_pa = float(((kr_rate - us_rate)).mean())
+    else:
+        carry = pd.Series(0.0, index=idx[1:])
+        rate_note, avg_carry_pa = "해당 없음 (달러 자산 없음)", 0.0
+
+    # ── 5. 일별 총수익률 (현지통화) ──
+    returns = prices.pct_change().iloc[1:]
+    n_days = len(returns)
+    R = returns[pt].to_numpy(dtype="float64")
+    fx_col = fx_ret.reindex(returns.index).fillna(0.0).to_numpy(dtype="float64")[:, None]
+    car_col = carry.reindex(returns.index).fillna(0.0).to_numpy(dtype="float64")[:, None]
+
+    is_us = np.array([t in us_set for t in pt])
+    is_krfx = np.array([t in KR_LISTED_US_FX for t in pt])
+
+    def decompose(h: float):
+        """
+        원화 수익률 = 현지수익률 + 환효과 + 헤지carry
+        - 미국 상장(헤지비율 h): (1+r)(1+fx) − 1 − h·(fx − carry)
+              → 현지 r / 환효과 (1−h)·fx + r·fx / carry h·carry
+        - 국내상장 환노출 ETF: 현지 = (1+r)/(1+fx) − 1, 환효과 = r − 현지
+        """
+        local = R.copy()
+        fxp = np.zeros_like(R)
+        cp = np.zeros_like(R)
+        if is_us.any():
+            r_us = R[:, is_us]
+            fxp[:, is_us] = (1 - h) * fx_col + r_us * fx_col
+            cp[:, is_us] = h * car_col
+        if is_krfx.any():
+            r_kf = R[:, is_krfx]
+            loc = (1 + r_kf) / (1 + fx_col) - 1
+            local[:, is_krfx] = loc
+            fxp[:, is_krfx] = r_kf - loc
+        return local, fxp, cp
+
+    # ── 6. 비중 산출 ──
+    weights, cat_weights = _calc_weights(params, pt)
     if not weights:
         st.error("❌ 유효 비중을 산출할 수 없습니다.")
         return None
+    weight_vec = np.array([weights.get(t, 0.0) for t in pt], dtype="float64")
 
-    weight_vec = np.array([weights.get(t, 0.0) for t in portfolio_tickers], dtype="float64")
-
-    # 7. TAA 시그널 (RSI 과매도 / 턴어라운드)
+    # ── 7. TAA 시그널 (① 시차 보정) ──
     taa_signal = pd.Series(0.0, index=returns.index)
-    if params["rsi_taa_enabled"] and "SPY" in asset_prices.columns:
-        spy_rsi = calc_rsi(asset_prices["SPY"], params["rsi_period"]).reindex(returns.index)
-        taa_signal = compute_rsi_signal(
-            spy_rsi, params["rsi_entry"], params["rsi_exit"], params["rsi_max_days"]
-        )
+    taa_days_rsi = 0
+    if params["rsi_taa_enabled"]:
+        warm_start = (first_valid - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+        spy_raw = fetch_raw("SPY", warm_start, e_str)
+        if not spy_raw.empty:
+            spy_tr, _ = build_total_return(spy_raw)
+            spy_rsi = calc_rsi(spy_tr, params["rsi_period"])      # 미국 영업일 그대로 계산
+            sig_native = compute_rsi_signal(
+                spy_rsi, params["rsi_entry"], params["rsi_exit"], params["rsi_max_days"]
+            )
+            taa_signal = align_signal_no_lookahead(
+                sig_native, idx, native_is_us=True, calendar_is_kr=calendar_is_kr,
+            ).reindex(returns.index).fillna(0.0)
+            taa_days_rsi = int((taa_signal > 0).sum())
+        else:
+            st.warning("⚠️ SPY 데이터를 불러오지 못해 RSI TAA를 적용하지 않았습니다.")
 
     if params["turnaround_enabled"] and params["turnaround_years"]:
         t_mask = returns.index.year.isin(params["turnaround_years"])
-        taa_signal = ((taa_signal > 0) | t_mask).astype("float32")
+        taa_signal = ((taa_signal > 0) | t_mask).astype("float64")
 
-    # 8. TAA 동적 비중 반영
-    n_days = len(returns)
+    # ── 8. TAA 동적 비중 반영 ──
     weight_matrix = np.tile(weight_vec, (n_days, 1))
-
-    all_eq_tickers = [t for t in params["us_equity"] + params["kr_equity"] if t in portfolio_tickers]
-    all_bd_tickers = [t for t in params["us_bonds"] + params["kr_bonds"] if t in portfolio_tickers]
-
-    eq_idx = [i for i, t in enumerate(portfolio_tickers) if t in all_eq_tickers]
-    bd_idx = [i for i, t in enumerate(portfolio_tickers) if t in all_bd_tickers]
+    eq_idx = [i for i, t in enumerate(pt) if group.get(t) == "equity"]
+    bd_idx = [i for i, t in enumerate(pt) if group.get(t) == "bond"]
+    alt_idx = [i for i, t in enumerate(pt) if group.get(t) == "alt"]
 
     base_eq_w = weight_vec[eq_idx].sum() if eq_idx else 0.0
     base_bd_w = weight_vec[bd_idx].sum() if bd_idx else 0.0
     target_eq = 0.30
 
-    taa_mask = taa_signal.values > 0
+    taa_mask = taa_signal.to_numpy() > 0
     if taa_mask.any() and base_eq_w > 0 and base_bd_w > 0 and target_eq > base_eq_w:
         eq_scale = target_eq / base_eq_w
         reduce   = target_eq - base_eq_w
@@ -521,76 +893,114 @@ def run_backtest(params: dict) -> dict | None:
         for i in bd_idx:
             weight_matrix[taa_mask, i] = weight_vec[i] * bd_scale
 
-    # 9. 포트폴리오 일별 수익률 산출
-    ret_open_mat   = ret_open[portfolio_tickers].values
-    ret_hedged_mat = ret_hedged[portfolio_tickers].values
+    # ── 9. 포트폴리오 일별 수익률 ──
+    # 공모주 Alpha: 실제 경과 달력일로 일할 (②)
+    dt_arr = dt.reindex(returns.index).to_numpy(dtype="float64")
+    alpha_arr = (1 + params["ipo_alpha"] / 100.0) ** (dt_arr / DAY_COUNT) - 1
 
-    port_open   = (ret_open_mat   * weight_matrix).sum(axis=1)
-    port_hedged = (ret_hedged_mat * weight_matrix).sum(axis=1)
+    h_user = params["hedge_ratio"] / 100.0
+    local_u, fx_u, car_u = decompose(h_user)
+    port_open_arr = (weight_matrix * (local_u + fx_u + car_u)).sum(axis=1) + alpha_arr
 
-    # 공모주 Alpha 가산
-    alpha_daily = params["ipo_alpha"] / 100.0 / 252.0
-    port_open   += alpha_daily
-    port_hedged += alpha_daily
+    local_h, fx_h, car_h = decompose(1.0)
+    port_hedged_arr = (weight_matrix * (local_h + fx_h + car_h)).sum(axis=1) + alpha_arr
 
-    port_open   = pd.Series(port_open,   index=returns.index, dtype="float64")
-    port_hedged = pd.Series(port_hedged, index=returns.index, dtype="float64")
+    port_open = pd.Series(port_open_arr, index=returns.index, dtype="float64")
+    port_hedged = pd.Series(port_hedged_arr, index=returns.index, dtype="float64")
 
-    # 10. NAV 산출
-    nav_open    = (1 + port_open).cumprod()   * 100.0
-    nav_hedged  = (1 + port_hedged).cumprod() * 100.0
-    nav_bench   = (1 + bench_open).cumprod()  * 100.0
+    # 벤치마크: SPY 총수익 원화 환산 (환오픈)
+    if "SPY" in returns.columns:
+        bench_open = (1 + returns["SPY"]) * (1 + fx_ret.reindex(returns.index).fillna(0.0)) - 1
+    else:
+        bench_open = pd.Series(0.0, index=returns.index)
 
-    # 11. 주요 KPI 산출 (단기/장기 구분)
+    # ── 10. NAV (기준일 = 100 포함) ──
+    def to_nav(daily: pd.Series) -> pd.Series:
+        nav = (1 + daily).cumprod() * 100.0
+        return pd.concat([pd.Series([100.0], index=[idx[0]]), nav])
+
+    nav_open = to_nav(port_open)
+    nav_hedged = to_nav(port_hedged)
+    nav_bench = to_nav(bench_open)
+
+    # ── 11. KPI ──
     metric_open, ann_open, is_short = calc_returns_and_cagr(nav_open)
-    metric_hedged, ann_hedged, _    = calc_returns_and_cagr(nav_hedged)
-    mdd_val     = calc_mdd(nav_open)
-    vol_val     = calc_volatility(port_open)
-    sharpe_val  = calc_sharpe(port_open, rf_annual=0.03)
-    fx_contrib  = ann_open - ann_hedged
+    _, ann_hedged, _ = calc_returns_and_cagr(nav_hedged)
+    mdd_val    = calc_mdd(nav_open)
+    vol_val    = calc_volatility(port_open, periods_per_year)
+    sharpe_val = calc_sharpe(port_open, dt, periods_per_year)
 
-    cumul   = (float(nav_open.iloc[-1])  / float(nav_open.iloc[0])  - 1) * 100
-    b_cumul = (float(nav_bench.iloc[-1]) / float(nav_bench.iloc[0]) - 1) * 100
+    cumul   = (float(nav_open.iloc[-1])  / 100.0 - 1) * 100
+    b_cumul = (float(nav_bench.iloc[-1]) / 100.0 - 1) * 100
 
-    # 12. 목표수익률 8%대 대비 성과 기여도 분해 (Attribution)
-    bond_daily = np.zeros(n_days)
-    for i in bd_idx:
-        bond_daily += ret_hedged_mat[:, i] * weight_matrix[:, i]
-    if n_days > 0:
-        if is_short:
-            cagr_bond = (float(np.prod(1 + bond_daily)) - 1) * 100
-        else:
-            cagr_bond = (float(np.prod(1 + bond_daily)) ** (252 / n_days) - 1) * 100
-    else:
-        cagr_bond = 0.0
+    # ── 12. ⑤ 성과 기여도 분해 (NAV 가중 linking → 합계 = 총수익률) ──
+    growth = np.r_[1.0, np.cumprod(1 + port_open_arr)[:-1]]     # NAV_{t-1}/NAV_0
 
-    eq_daily = np.zeros(n_days)
-    for i in eq_idx:
-        eq_daily += ret_hedged_mat[:, i] * weight_matrix[:, i]
-    if n_days > 0:
-        if is_short:
-            cagr_eq = (float(np.prod(1 + eq_daily)) - 1) * 100
-        else:
-            cagr_eq = (float(np.prod(1 + eq_daily)) ** (252 / n_days) - 1) * 100
-    else:
-        cagr_eq = 0.0
+    def linked(daily_component: np.ndarray) -> float:
+        return float((daily_component * growth).sum())
 
-    cagr_fx = fx_contrib
-    cagr_ipo = params["ipo_alpha"] if not is_short else params["ipo_alpha"] * (n_days / 252)
+    def bucket_local(cols_idx: list[int]) -> np.ndarray:
+        if not cols_idx:
+            return np.zeros(n_days)
+        return (weight_matrix[:, cols_idx] * local_u[:, cols_idx]).sum(axis=1)
 
-    attribution = {
-        "bond_contrib": cagr_bond,
-        "eq_contrib":   cagr_eq,
-        "fx_contrib":   cagr_fx,
-        "ipo_contrib":  cagr_ipo,
-        "total_cagr":   ann_open if not is_short else cumul,
+    cum_parts = {
+        "bond_contrib":  linked(bucket_local(bd_idx)),
+        "eq_contrib":    linked(bucket_local(eq_idx)),
+        "alt_contrib":   linked(bucket_local(alt_idx)),
+        "fx_contrib":    linked((weight_matrix * fx_u).sum(axis=1)),
+        "carry_contrib": linked((weight_matrix * car_u).sum(axis=1)),
+        "ipo_contrib":   linked(alpha_arr),
     }
+    cum_total = float(nav_open.iloc[-1]) / 100.0 - 1          # == sum(cum_parts)
+
+    if is_short:
+        scale = 100.0                                            # 기간 누적 (%)
+        total_display = cumul
+    else:
+        years = (nav_open.index[-1] - nav_open.index[0]).days / 365.25
+        ann_total = ann_open / 100.0
+        # 누적 기여도를 CAGR에 비례 배분 (합계 = CAGR 정확히 일치)
+        scale = (ann_total / cum_total * 100.0) if abs(cum_total) > 1e-12 else (100.0 / years)
+        total_display = ann_open
+
+    attribution = {k: v * scale for k, v in cum_parts.items()}
+    attribution["total_cagr"] = total_display
+    attribution["check_gap"] = total_display - sum(v for k, v in attribution.items()
+                                                   if k.endswith("_contrib"))
+
+    # ── 13. 데이터 품질 점검표 (⑥) ──
+    span_years = max((idx[-1] - idx[0]).days / 365.25, 1e-9)
+    dq_rows = []
+    for t in avail_mkt:
+        d = divs[t].loc[idx[0]:idx[-1]]
+        c_prev = raw[t]["close"].shift(1).reindex(d.index)
+        n_div = int((d > 0).sum())
+        yld = float((d / c_prev).fillna(0.0).sum()) / span_years * 100
+        src = "분배금 CSV" if t in dist_override else "yfinance"
+        status = "정상"
+        name = ALL_NAMES.get(t, t)
+        if is_kr_ticker(t) and n_div == 0 and span_years >= 1.0 and "TR" not in name:
+            status = "⚠️ 분배금 0건 — TR형이 아니라면 누락 의심, 분배금 CSV 업로드 권장"
+        elif is_kr_ticker(t) and n_div == 0 and span_years < 1.0 and "TR" not in name:
+            status = "ℹ️ 기간 내 분배 없음 (단기 구간이면 정상일 수 있음)"
+        dq_rows.append({
+            "종목": t.replace(".KS", ""), "종목명": name, "데이터 출처": src,
+            "분배금 건수": n_div, "연환산 분배수익률(%)": round(yld, 2), "상태": status,
+        })
+    if "BANK_DEPOSIT" in pt:
+        dq_rows.append({"종목": "BANK_DEPOSIT", "종목명": CASH_OPTS["BANK_DEPOSIT"],
+                        "데이터 출처": "합성 (ACT/365 일할)", "분배금 건수": 0,
+                        "연환산 분배수익률(%)": round(BANK_RATE * 100, 2), "상태": "정상"})
+    data_quality = pd.DataFrame(dq_rows)
 
     return {
         "nav_open":             nav_open,
         "nav_hedged":           nav_hedged,
         "nav_benchmark":        nav_bench,
         "daily_returns":        port_open,
+        "dt_days":              dt,
+        "periods_per_year":     periods_per_year,
         "cagr":                 ann_open,
         "metric_display":       metric_open,
         "is_short_term":        is_short,
@@ -598,7 +1008,7 @@ def run_backtest(params: dict) -> dict | None:
         "mdd":                  mdd_val,
         "volatility":           vol_val,
         "sharpe":               sharpe_val,
-        "fx_contribution":      fx_contrib,
+        "fx_contribution":      attribution["fx_contrib"],
         "cumulative_return":    cumul,
         "benchmark_cumulative": b_cumul,
         "yearly_portfolio":     calc_yearly_returns(nav_open),
@@ -608,10 +1018,16 @@ def run_backtest(params: dict) -> dict | None:
         "weights":              weights,
         "category_weights":     cat_weights,
         "attribution":          attribution,
-        "analysis_start":       returns.index[0],
-        "analysis_end":         returns.index[-1],
-        "total_days":           (returns.index[-1] - returns.index[0]).days,
-        "trading_days":         len(returns),
+        "analysis_start":       idx[0],
+        "analysis_end":         idx[-1],
+        "total_days":           (idx[-1] - idx[0]).days,
+        "trading_days":         n_days,
+        "calendar_label":       calendar_label,
+        "rate_note":            rate_note,
+        "avg_carry_pa":         avg_carry_pa,
+        "hedge_ratio":          params["hedge_ratio"],
+        "taa_days_rsi":         taa_days_rsi,
+        "data_quality":         data_quality,
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -632,70 +1048,56 @@ def render_sidebar() -> tuple[dict, bool]:
         st.divider()
         st.header("⚙️ 시뮬레이션 파라미터")
 
-        # ── 1. 분석 기간 (2025년 이후 및 단기 프리셋 지원) ──
-        with st.expander("📅 분석 기간 설정 (단기/장기 자유 선택)", expanded=True):
+        # ── 1. 분석 기간 (상장일 2023-11-14 기준, 프리셋 ↔ 날짜 선택기 동기화) ──
+        with st.expander("📅 분석 기간 설정", expanded=True):
             today = date.today()
-            preset_options = [
-                "2025년 이후 ~ 현재 (2025-01-01 ~ 오늘)",
-                "최근 1개월 (초단기)",
-                "최근 3개월 (단기)",
-                "최근 6개월",
-                "YTD (올해 연초 ~ 현재)",
-                "최근 1년",
-                "최근 3년",
-                "최근 5년",
-                "전체 기간 (2015-01-01 ~ 현재)",
-                "직접 날짜 입력",
-            ]
-            preset = st.selectbox("⚡ 간편 기간 프리셋", preset_options, index=0)
+            ss = st.session_state
 
-            # 프리셋별 기본 날짜 설정
-            if preset == "2025년 이후 ~ 현재 (2025-01-01 ~ 오늘)":
-                d_start = date(2025, 1, 1)
-                d_end = today
-            elif preset == "최근 1개월 (초단기)":
-                d_start = today - timedelta(days=30)
-                d_end = today
-            elif preset == "최근 3개월 (단기)":
-                d_start = today - timedelta(days=90)
-                d_end = today
-            elif preset == "최근 6개월":
-                d_start = today - timedelta(days=180)
-                d_end = today
-            elif preset == "YTD (올해 연초 ~ 현재)":
-                d_start = date(today.year, 1, 1)
-                d_end = today
-            elif preset == "최근 1년":
-                d_start = today - timedelta(days=365)
-                d_end = today
-            elif preset == "최근 3년":
-                d_start = today - timedelta(days=365 * 3)
-                d_end = today
-            elif preset == "최근 5년":
-                d_start = today - timedelta(days=365 * 5)
-                d_end = today
-            elif preset == "전체 기간 (2015-01-01 ~ 현재)":
-                d_start = date(2015, 1, 1)
-                d_end = today
-            else:
-                d_start = date(2025, 1, 1)
-                d_end = today
+            # 최초 진입(또는 로그아웃 후) 기본값: 상장 이후 전체
+            if ss.get("period_preset") not in PERIOD_PRESETS:
+                ss["period_preset"] = PRESET_SINCE_LISTING
+            if "period_start" not in ss or "period_end" not in ss:
+                init = preset_date_range(ss["period_preset"], today) or (LISTING_DATE, today)
+                ss["period_start"], ss["period_end"] = init
+
+            # 유효성 검증: 저장된 값이 상장일 이전·오늘 이후로 벗어나지 않도록 위젯 생성 전에 보정
+            ss["period_start"] = clamp_period_date(ss["period_start"], today)
+            ss["period_end"] = clamp_period_date(ss["period_end"], today)
+
+            def _on_preset_change():
+                rng = preset_date_range(st.session_state["period_preset"], date.today())
+                if rng is not None:          # '사용자 직접 지정'이면 현재 날짜 유지
+                    st.session_state["period_start"], st.session_state["period_end"] = rng
+
+            def _on_date_change():
+                # 날짜를 직접 바꾸면 프리셋 표시를 '사용자 직접 지정'으로 전환
+                st.session_state["period_preset"] = PRESET_CUSTOM
+
+            st.selectbox(
+                "⚡ 간편 기간 프리셋", PERIOD_PRESETS,
+                key="period_preset", on_change=_on_preset_change,
+            )
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
                 start_date = st.date_input(
                     "시작일",
-                    value=d_start,
-                    min_value=date(2000, 1, 1),
+                    min_value=LISTING_DATE,
                     max_value=today,
+                    key="period_start",
+                    on_change=_on_date_change,
                 )
             with col_d2:
                 end_date = st.date_input(
                     "종료일",
-                    value=d_end,
-                    min_value=date(2000, 1, 1),
+                    min_value=LISTING_DATE,
                     max_value=today,
+                    key="period_end",
+                    on_change=_on_date_change,
                 )
+            st.caption(
+                f"※ 국내 국고채10년액티브 ETF(471230) 상장일({LISTING_DATE:%Y-%m-%d}) 이후 전체 유효 구간입니다."
+            )
 
             if start_date >= end_date:
                 st.error("⚠️ 시작일은 종료일보다 이전이어야 합니다.")
@@ -757,17 +1159,19 @@ def render_sidebar() -> tuple[dict, bool]:
                 st.success(f"합계 비중: **{total_raw_w}%** (정상)")
             else:
                 st.info(f"합계: **{total_raw_w}%** → 포트폴리오 편입 시 **100% 자동 정규화** 적용")
+            st.caption("비중 0%인 자산군의 종목은 공통 구간 계산에서 제외됩니다.")
 
         # ── 5. 공모주 수익 기여도(Alpha) ──
         with st.expander("💰 공모주 수익 기여도 (Alpha)", expanded=False):
             ipo_alpha = st.slider(
                 "공모주 연간 Alpha 가산 (%p)", 0.0, 1.0, 0.0, 0.05,
-                help="일할 가산하여 포트폴리오 일간 수익률에 반영됩니다. (목표 모델: 0~1%대)"
+                help="실제 경과 달력일 기준으로 일할 가산됩니다. (목표 모델: 0~1%대)"
             )
 
         # ── 6. 동적 TAA (전술적 자산배분) ──
         with st.expander("🔄 동적 TAA (전술적 자산배분) 토글", expanded=False):
             st.caption("**[전략 1] 기술적 지표 14일 RSI 과매도 탄력 운용**")
+            st.caption("신호는 SPY 종가 확인 후 **다음 영업일 수익률부터** 적용됩니다 (미래 정보 미사용).")
             rsi_on = st.toggle("RSI 과매도 TAA 활성화", value=False)
             rsi_period = 14; rsi_entry = 30; rsi_exit = 60; rsi_max = 20
             if rsi_on:
@@ -780,7 +1184,8 @@ def render_sidebar() -> tuple[dict, bool]:
             ta_on = st.toggle("턴어라운드 모드 활성화 (주식 비중 30% 확대)", value=False)
             ta_years: list[int] = []
             if ta_on:
-                yr_range = list(range(2015, date.today().year + 1))
+                st.caption("⚠️ 연도를 사후에 고르는 방식이라 결과에 hindsight bias가 포함됩니다.")
+                yr_range = list(range(LISTING_DATE.year, date.today().year + 1))
                 ta_years = st.multiselect("적극 투자 국면 연도 선택", yr_range, default=[])
 
         # ── 7. 환율 및 통화 비교 제어 ──
@@ -791,6 +1196,39 @@ def render_sidebar() -> tuple[dict, bool]:
                 help="0% = 100% 환오픈 (기본값), 100% = 완전 환헤지"
             )
             show_hedged = st.checkbox("환헤지(USD) 수익률 비교 라인 표시", value=True)
+
+            st.markdown("**헤지 비용(금리차) 산출**")
+            hedge_cost_mode = st.radio(
+                "헤지 비용 산출 방식", ["자동", "수동"], horizontal=True,
+                label_visibility="collapsed",
+                help="헤지 손익 ≈ (원화 단기금리 − 달러 단기금리) × 기간. 원화 금리가 낮으면 비용(−).",
+            )
+            c_r1, c_r2 = st.columns(2)
+            with c_r1:
+                manual_kr_rate = st.number_input("원화 단기금리 (연 %)", 0.0, 15.0, 2.50, 0.05, format="%.2f")
+            with c_r2:
+                manual_us_rate = st.number_input("달러 단기금리 (연 %)", 0.0, 15.0, 4.00, 0.05, format="%.2f")
+            st.caption(
+                "자동: 달러 ^IRX(미 T-bill 3M), 원화 FRED 한국 3M 금리(월별). "
+                "조회 실패 시 위 수동값을 사용합니다. 수동값은 현재 시장금리로 확인 후 입력하세요."
+            )
+
+        # ── 8. 한국 ETF 분배금 데이터 (총수익 보정) ──
+        with st.expander("🧾 한국 ETF 분배금 데이터 (총수익 보정)", expanded=False):
+            st.caption(
+                "yfinance는 한국 ETF 분배금이 누락되는 경우가 있습니다. "
+                "KRX 정보데이터시스템·운용사 공시의 분배금 내역을 CSV로 올리면 해당 종목은 업로드 값으로 총수익을 계산합니다."
+            )
+            dist_file = st.file_uploader("분배금 CSV 업로드", type=["csv"], key="dist_csv")
+            dist_override: dict[str, pd.Series] = {}
+            if dist_file is not None:
+                dist_override, msg = parse_distribution_csv(dist_file)
+                (st.success if dist_override else st.error)(msg)
+            st.download_button(
+                "CSV 양식 받기", data=DIST_TEMPLATE_CSV.encode("utf-8-sig"),
+                file_name="분배금_양식.csv", mime="text/csv", key="dist_tpl",
+            )
+            st.caption("컬럼: 종목코드, 배당락일(또는 지급기준일), 분배금(1좌당 원)")
 
         st.divider()
         run_clicked = st.button("🚀 시뮬레이션 재실행", type="primary", use_container_width=True)
@@ -819,6 +1257,10 @@ def render_sidebar() -> tuple[dict, bool]:
         "turnaround_years": ta_years,
         "hedge_ratio":      hedge_ratio,
         "show_hedged_line": show_hedged,
+        "hedge_cost_mode":  hedge_cost_mode,
+        "manual_kr_rate":   manual_kr_rate,
+        "manual_us_rate":   manual_us_rate,
+        "dist_override":    dist_override,
     }
     return params, run_clicked
 
@@ -833,9 +1275,11 @@ def render_dashboard(res: dict, show_hedged: bool):
     is_short = res.get("is_short_term", False)
     trading_days = res.get("trading_days", 0)
     total_days = res.get("total_days", 0)
+    ppy = res.get("periods_per_year", 252.0)
 
     st.caption(
-        f"분석 데이터 구간: **{p_start} ~ {p_end}** ({total_days}일, {trading_days}영업일) | 통화 기준: **KRW (원화)**"
+        f"분석 데이터 구간: **{p_start} ~ {p_end}** ({total_days}일, {trading_days}영업일) | "
+        f"기준 캘린더: **{res.get('calendar_label', '-')}** (연 {ppy:.0f}회 관측) | 통화 기준: **KRW (원화)**"
     )
 
     if is_short:
@@ -844,10 +1288,13 @@ def render_dashboard(res: dict, show_hedged: bool):
             <div class="short-banner">
             ⚡ <b>단기 모니터링 모드 활성화</b>: 조회 기간이 1년 미만({trading_days}영업일)입니다.
             기간 단순 누적 수익률을 중심으로 분석하며, 연환산(참고치)이 함께 병기됩니다.
+            기여도 분해도 모두 <b>기간 누적 기준(%p)</b>으로 표시됩니다.
             </div>
             """,
             unsafe_allow_html=True,
         )
+
+    attr = res["attribution"]
 
     # ────────────────────────────────────────────────────────────────
     # [1] 상단 KPI 메트릭 카드 5개
@@ -877,9 +1324,11 @@ def render_dashboard(res: dict, show_hedged: bool):
             delta_color="off",
         )
     with k4:
-        sign = "+" if res["fx_contribution"] >= 0 else ""
-        label_fx = "환차익 기여도" if not is_short else "환차익 기여(연환산)"
-        st.metric(label_fx, f"{sign}{res['fx_contribution']:.2f}%p")
+        label_fx = "환차익 기여도 (연)" if not is_short else "환차익 기여 (기간)"
+        st.metric(
+            label_fx, f"{res['fx_contribution']:+.2f}%p",
+            delta=f"헤지 손익 {attr['carry_contrib']:+.2f}%p", delta_color="off",
+        )
     with k5:
         st.metric(
             "누적 수익률 vs BM",
@@ -894,51 +1343,65 @@ def render_dashboard(res: dict, show_hedged: bool):
     # [2] 목표수익률 8%대 달성도 & 성과 기여도 분해 (Performance Attribution)
     # ────────────────────────────────────────────────────────────────
     st.subheader("🎯 목표수익률 8%대 달성도 및 성과 기여도 분해 (Attribution Analysis)")
+    unit_txt = "기간 누적 기준" if is_short else "연환산(CAGR) 기준"
     st.markdown(
-        """
-        자산운용 펀드 상품 기획 시 설계된 **4대 핵심 기대수익 구조**와 실제 백테스팅 기간 동안의 **실현 기여도**를 정밀 비교합니다.
+        f"""
+        자산운용 펀드 상품 기획 시 설계된 **4대 핵심 기대수익 구조**와 실제 백테스팅 기간 동안의 **실현 기여도**를 비교합니다.
+        모든 항목은 **{unit_txt}**이며, 일별 기여도를 직전 NAV로 연결(linking)해 **항목 합계가 총수익률과 정확히 일치**합니다.
         """
     )
 
-    attr = res["attribution"]
-
-    a1, a2, a3, a4, a5 = st.columns(5)
+    a1, a2, a3, a4 = st.columns(4)
     with a1:
-        st.metric("① 국채 ETF 기여도", f"{attr['bond_contrib']:+.2f}%p", help="목표 모델: 3~4%대 (국채 90% × 채권 연수익 4~5%)")
+        st.metric("① 국채 ETF 기여도", f"{attr['bond_contrib']:+.2f}%p",
+                  help="채권 ETF의 현지통화 총수익(이자+가격) 기여. 환효과는 ③에 별도 집계")
         st.caption("📌 **목표 모델**: 3.0~4.0%p")
     with a2:
-        st.metric("② 지수 ETF 기여도", f"{attr['eq_contrib']:+.2f}%p", help="목표 모델: 0~3%대 (지수 10% × 주식 연수익 0~30%)")
+        st.metric("② 지수 ETF 기여도", f"{attr['eq_contrib']:+.2f}%p",
+                  help="지수 ETF의 현지통화 총수익 기여 (국내상장 미국지수 ETF는 환효과를 분리)")
         st.caption("📌 **목표 모델**: 0.0~3.0%p")
     with a3:
-        st.metric("③ 환차익 기여도", f"{attr['fx_contrib']:+.2f}%p", help="목표 모델: 3~5%대 (미국 자산 환노출, 연평균 3% 이상 원화 약세)")
+        st.metric("③ 환차익 기여도", f"{attr['fx_contrib']:+.2f}%p",
+                  help="USD/KRW 변동에 따른 환산 손익 (환오픈 부분 + 수익분의 환노출)")
         st.caption("📌 **목표 모델**: 3.0~5.0%p")
     with a4:
-        st.metric("④ 공모주 Alpha", f"{attr['ipo_contrib']:+.2f}%p", help="목표 모델: 0~1%대 (연 0~1%p 가산)")
+        st.metric("④ 공모주 Alpha", f"{attr['ipo_contrib']:+.2f}%p", help="연 0~1%p 가정치 (달력일 일할)")
         st.caption("📌 **목표 모델**: 0.0~1.0%p")
-    with a5:
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.metric("⑤ 금·현금성 기여도", f"{attr['alt_contrib']:+.2f}%p", help="GLDM, 단기채권 ETF, 은대")
+    with b2:
+        st.metric(
+            "⑥ 환헤지 손익 (금리차)", f"{attr['carry_contrib']:+.2f}%p",
+            help=f"헤지비율 {res.get('hedge_ratio', 0)}% × (원화 − 달러 단기금리). "
+                 f"기간 평균 금리차 {res.get('avg_carry_pa', 0):+.2f}%p/년",
+        )
+    with b3:
         label_total = "합산 실현 수익률" if is_short else "합산 실현 CAGR"
         st.metric(label_total, f"{attr['total_cagr']:.2f}%", delta=f"{attr['total_cagr'] - 8.0:+.2f}%p vs 8.0% 목표")
         st.caption("🏆 **목표 종합**: **8.0% ~ 10.0%대**")
 
-    # 성과 기여도 바 차트
+    labels = ["① 국채 ETF", "② 지수 ETF", "③ 환차익(USD/KRW)", "④ 공모주 Alpha",
+              "⑤ 금·현금성", "⑥ 환헤지 손익", "합산 실현치"]
+    values = [attr['bond_contrib'], attr['eq_contrib'], attr['fx_contrib'], attr['ipo_contrib'],
+              attr['alt_contrib'], attr['carry_contrib'], attr['total_cagr']]
     fig_attr = go.Figure(go.Bar(
-        x=["① 국채 ETF", "② 지수 ETF", "③ 환차익(USD/KRW)", "④ 공모주 Alpha", "합산 실현치"],
-        y=[attr['bond_contrib'], attr['eq_contrib'], attr['fx_contrib'], attr['ipo_contrib'], attr['total_cagr']],
-        marker=dict(color=["#1976D2", "#388E3C", "#F57C00", "#7B1FA2", "#D32F2F"]),
-        text=[f"{v:+.2f}%p" if i < 4 else f"{v:.2f}%" for i, v in enumerate(
-            [attr['bond_contrib'], attr['eq_contrib'], attr['fx_contrib'], attr['ipo_contrib'], attr['total_cagr']]
-        )],
+        x=labels, y=values,
+        marker=dict(color=["#1976D2", "#388E3C", "#F57C00", "#7B1FA2", "#8D6E63", "#00838F", "#D32F2F"]),
+        text=[f"{v:+.2f}%p" if i < 6 else f"{v:.2f}%" for i, v in enumerate(values)],
         textposition="outside",
     ))
     fig_attr.add_hline(y=8.0, line_dash="dash", line_color="#E53935", annotation_text="목표 수익률 8.0%")
     fig_attr.update_layout(
-        title="원천별 수익 기여도 분해 (%p)",
+        title=f"원천별 수익 기여도 분해 (%p, {unit_txt})",
         template="plotly_white",
         yaxis_title="수익 기여도 (%p)",
-        height=320,
+        height=340,
         margin=dict(l=20, r=20, t=40, b=20),
     )
     st.plotly_chart(fig_attr, use_container_width=True)
+    st.caption(f"헤지 금리 출처: {res.get('rate_note', '-')}")
 
     st.divider()
 
@@ -949,13 +1412,13 @@ def render_dashboard(res: dict, show_hedged: bool):
     fig_nav = go.Figure()
     fig_nav.add_trace(go.Scatter(
         x=res["nav_open"].index, y=res["nav_open"].values,
-        name="혼합형 펀드 (환오픈, 기본)",
+        name=f"혼합형 펀드 (환헤지 {res.get('hedge_ratio', 0)}%)",
         line=dict(color="#1565C0", width=2.5),
     ))
     if show_hedged:
         fig_nav.add_trace(go.Scatter(
             x=res["nav_hedged"].index, y=res["nav_hedged"].values,
-            name="혼합형 펀드 (환헤지 100%)",
+            name="혼합형 펀드 (환헤지 100%, 헤지비용 반영)",
             line=dict(color="#E65100", width=2, dash="dash"),
         ))
     fig_nav.add_trace(go.Scatter(
@@ -999,10 +1462,11 @@ def render_dashboard(res: dict, show_hedged: bool):
     with t1:
         st.subheader("📋 테이블 1 — 성과 및 리스크 요약")
         bench_ret = res["nav_benchmark"].pct_change().dropna()
+        dt_days = res.get("dt_days")
         cagr_label = "연평균 복리수익률 (CAGR)" if not is_short else "기간 누적수익률 (연환산)"
         summary = pd.DataFrame({
             "지표": ["누적 수익률", cagr_label, "연환산 변동성", "샤프 지수 (Rf=3%)", "최대 낙폭 (MDD)"],
-            "혼합형 펀드 (환오픈)": [
+            "혼합형 펀드": [
                 f"{res['cumulative_return']:.2f}%",
                 f"{res['cagr']:.2f}%",
                 f"{res['volatility']:.2f}%",
@@ -1012,8 +1476,8 @@ def render_dashboard(res: dict, show_hedged: bool):
             "S&P500 벤치마크(KRW)": [
                 f"{res['benchmark_cumulative']:.2f}%",
                 f"{calc_returns_and_cagr(res['nav_benchmark'])[1]:.2f}%",
-                f"{calc_volatility(bench_ret):.2f}%",
-                f"{calc_sharpe(bench_ret):.2f}",
+                f"{calc_volatility(bench_ret, ppy):.2f}%",
+                f"{calc_sharpe(bench_ret, dt_days, ppy):.2f}",
                 f"{calc_mdd(res['nav_benchmark']):.2f}%",
             ],
         })
@@ -1026,14 +1490,19 @@ def render_dashboard(res: dict, show_hedged: bool):
             "S&P500(KRW)": res["yearly_benchmark"].round(2),
         })
         if show_hedged:
-            yearly["환헤지 포트폴리오"] = res["yearly_hedged"].round(2)
-        yearly.index.name = "연도"
+            yearly["환헤지 100%"] = res["yearly_hedged"].round(2)
+        yearly = yearly[yearly.index >= LISTING_DATE.year]
+        y_labels, y_notes = yearly_labels(yearly.index, res["analysis_start"], res["analysis_end"])
+        yearly.index = pd.Index(y_labels, name="연도")
         st.dataframe(yearly, use_container_width=True)
+        for note in y_notes:
+            if note:
+                st.caption(note.replace("*", "\\*", 1))
 
     st.divider()
 
     # ────────────────────────────────────────────────────────────────
-    # [5] 자산배분 유효 비중 상세
+    # [5] 자산배분 유효 비중 상세 & 데이터 품질
     # ────────────────────────────────────────────────────────────────
     with st.expander("🔍 포트폴리오 유효 자산배분 비중 상세", expanded=False):
         c_cat, c_asset = st.columns(2)
@@ -1051,30 +1520,36 @@ def render_dashboard(res: dict, show_hedged: bool):
             ).sort_values("비중(%)", ascending=False).reset_index(drop=True)
             st.dataframe(w_df, hide_index=True, use_container_width=True)
 
+    dq = res.get("data_quality", pd.DataFrame())
+    n_warn = int(dq["상태"].astype(str).str.startswith("⚠️").sum()) if not dq.empty else 0
+    with st.expander(f"🧪 데이터 품질 점검 (총수익·분배금){' — ⚠️ ' + str(n_warn) + '건' if n_warn else ''}",
+                     expanded=n_warn > 0):
+        st.caption("모든 종목은 '분할 반영 종가 + 분배금 재투자'로 총수익을 직접 계산합니다.")
+        if not dq.empty:
+            st.dataframe(dq, hide_index=True, use_container_width=True)
+
     # ────────────────────────────────────────────────────────────────
     # [6] 엑셀 다운로드 (openpyxl 활용)
     # ────────────────────────────────────────────────────────────────
     nav_df = pd.DataFrame({
         "Date":        res["nav_open"].index,
-        "NAV_환오픈":   res["nav_open"].values.round(4),
-        "NAV_환헤지":   res["nav_hedged"].values.round(4),
+        "NAV_펀드":     res["nav_open"].values.round(4),
+        "NAV_환헤지100": res["nav_hedged"].values.round(4),
         "NAV_벤치마크": res["nav_benchmark"].values.round(4),
     })
+    yp = res["yearly_portfolio"][res["yearly_portfolio"].index >= LISTING_DATE.year]
+    yb = res["yearly_benchmark"].reindex(yp.index)
+    exp_labels, exp_notes = yearly_labels(yp.index, res["analysis_start"], res["analysis_end"])
     yearly_exp = pd.DataFrame({
-        "연도":            res["yearly_portfolio"].index,
-        "혼합형펀드(%)":    res["yearly_portfolio"].values.round(2),
-        "S&P500(KRW)(%)": res["yearly_benchmark"].values.round(2),
+        "연도":            exp_labels,
+        "혼합형펀드(%)":    yp.values.round(2),
+        "S&P500(KRW)(%)": yb.values.round(2),
+        "비고":            exp_notes,
     })
     attr_df = pd.DataFrame({
-        "구분": ["① 국채 ETF", "② 지수 ETF", "③ 환차익(USD/KRW)", "④ 공모주 Alpha", "합산 실현치"],
-        "설계 목표 모델": ["3.0 ~ 4.0%대", "0.0 ~ 3.0%대", "3.0 ~ 5.0%대", "0.0 ~ 1.0%대", "8.0 ~ 10.0%대"],
-        "백테스팅 실현 기여도(%p)": [
-            round(attr['bond_contrib'], 2),
-            round(attr['eq_contrib'], 2),
-            round(attr['fx_contrib'], 2),
-            round(attr['ipo_contrib'], 2),
-            round(attr['total_cagr'], 2),
-        ],
+        "구분": labels,
+        "설계 목표 모델": ["3.0 ~ 4.0%대", "0.0 ~ 3.0%대", "3.0 ~ 5.0%대", "0.0 ~ 1.0%대", "-", "-", "8.0 ~ 10.0%대"],
+        f"백테스팅 실현 기여도(%p, {unit_txt})": [round(v, 2) for v in values],
     })
 
     buf = io.BytesIO()
@@ -1083,6 +1558,8 @@ def render_dashboard(res: dict, show_hedged: bool):
         attr_df.to_excel(w, sheet_name="목표수익률기여도분해", index=False)
         yearly_exp.to_excel(w, sheet_name="연도별수익률", index=False)
         nav_df.to_excel(w, sheet_name="일별NAV", index=False)
+        if not dq.empty:
+            dq.to_excel(w, sheet_name="데이터품질", index=False)
 
     st.download_button(
         label="📥 엑셀 다운로드 (국채_ETF_혼합형펀드_백테스팅_결과.xlsx)",
@@ -1105,6 +1582,9 @@ def main():
     params, run_clicked = render_sidebar()
 
     if run_clicked:
+        if params["start_date"] >= params["end_date"]:
+            st.error("❌ 시작일은 종료일보다 이전이어야 합니다. 사이드바에서 기간을 다시 선택하세요.")
+            return
         has_any = (
             params["us_bonds"] or params["kr_bonds"]
             or params["us_equity"] or params["kr_equity"]
@@ -1129,7 +1609,7 @@ def main():
         )
     else:
         st.markdown("## 🏛️ 국채·지수 ETF 혼합형 펀드 퀀트 백테스팅 대시보드")
-        st.info("👈 좌측 사이드바에서 **분석 기간(2025년 이후/단기 프리셋 지원) 및 ETF 비중**을 설정하고 **🚀 시뮬레이션 재실행** 버튼을 누르세요.")
+        st.info(f"👈 좌측 사이드바에서 **분석 기간(기본: 상장 이후 전체 {LISTING_DATE:%Y-%m-%d} ~ 현재) 및 ETF 비중**을 설정하고 **🚀 시뮬레이션 재실행** 버튼을 누르세요.")
         st.markdown(
             """
             ### 🎯 목표수익률 8%대 펀드 포트폴리오 구조
