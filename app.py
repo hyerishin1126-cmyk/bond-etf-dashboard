@@ -136,6 +136,21 @@ LISTING_DATES: dict[str, date] = {
     "IEI":  date(2007, 1, 5),          # iShares 3-7 Year Treasury Bond ETF
     "GOVT": date(2012, 2, 14),         # iShares U.S. Treasury Bond ETF
     "SGOV": date(2020, 5, 26),         # iShares 0-3 Month Treasury Bond ETF
+    # 미국 지수 ETF (현지 기준 상장일)
+    "SPY":  date(1993, 1, 22),         # SPDR S&P 500 ETF Trust
+    "DIA":  date(1998, 1, 20),         # SPDR Dow Jones Industrial Average ETF Trust
+    "QQQ":  date(1999, 3, 10),         # Invesco QQQ Trust
+    "IVV":  date(2000, 5, 15),         # iShares Core S&P 500 ETF
+    "VOO":  date(2010, 9, 7),          # Vanguard S&P 500 ETF
+    "QQQM": date(2020, 10, 13),        # Invesco NASDAQ 100 ETF
+    # 한국 지수 ETF
+    "069500.KS": date(2002, 10, 14),   # KODEX 200 (국내 최초 상장 ETF)
+    "102110.KS": date(2008, 4, 3),     # TIGER 200
+    "133690.KS": date(2010, 10, 18),   # TIGER 미국나스닥100 (환노출)
+    "229200.KS": date(2015, 10, 1),    # KODEX 코스닥150
+    "305720.KS": date(2018, 11, 23),   # KODEX 200TR (배당 재투자)
+    "360750.KS": date(2020, 8, 7),     # TIGER 미국S&P500 (환노출)
+    "379800.KS": date(2021, 4, 9),     # KODEX 미국S&P500TR (배당 재투자)
 }
 
 US_EQUITY = {
@@ -1231,14 +1246,20 @@ def render_sidebar() -> tuple[dict, bool]:
             st.caption("🇺🇸 **미국 지수 ETF** (S&P500 / NASDAQ100)")
             us_equity = st.multiselect(
                 "미국 지수 ETF", list(US_EQUITY.keys()), default=["SPY"],
-                format_func=lambda x: f"{x} - {US_EQUITY[x]}",
+                format_func=lambda x: (
+                    f"{x} - {US_EQUITY[x]}"
+                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                ),
                 label_visibility="collapsed",
             )
 
             st.caption("🇰🇷 **한국 지수 ETF** (코스피200 / 코스닥150 / 국내상장 미국지수)")
             kr_equity = st.multiselect(
                 "한국 지수 ETF", list(KR_EQUITY.keys()), default=["069500.KS"],
-                format_func=lambda x: f"{x.replace('.KS','')} - {KR_EQUITY[x]}",
+                format_func=lambda x: (
+                    f"{x.replace('.KS','')} - {KR_EQUITY[x]}"
+                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                ),
                 label_visibility="collapsed",
             )
 
