@@ -129,6 +129,13 @@ LISTING_DATES: dict[str, date] = {
     "148070.KS": date(2011, 10, 20),   # KOSEF 국고채10년
     "439870.KS": date(2022, 8, 23),    # KODEX 국고채30년액티브
     "471230.KS": date(2023, 11, 14),   # KODEX 국고채10년액티브
+    # 미국 국고채 ETF (Inception Date)
+    "SHY":  date(2002, 7, 22),         # iShares 1-3 Year Treasury Bond ETF
+    "IEF":  date(2002, 7, 22),         # iShares 7-10 Year Treasury Bond ETF
+    "TLT":  date(2002, 7, 22),         # iShares 20+ Year Treasury Bond ETF
+    "IEI":  date(2007, 1, 5),          # iShares 3-7 Year Treasury Bond ETF
+    "GOVT": date(2012, 2, 14),         # iShares U.S. Treasury Bond ETF
+    "SGOV": date(2020, 5, 26),         # iShares 0-3 Month Treasury Bond ETF
 }
 
 US_EQUITY = {
@@ -1203,7 +1210,10 @@ def render_sidebar() -> tuple[dict, bool]:
             st.caption("🇺🇸 **미국 국고채 ETF**")
             us_bonds = st.multiselect(
                 "미국 국채", list(US_BOND.keys()), default=["IEF", "TLT"],
-                format_func=lambda x: f"{x} - {US_BOND[x]}",
+                format_func=lambda x: (
+                    f"{x} - {US_BOND[x]}"
+                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                ),
                 label_visibility="collapsed",
             )
 
