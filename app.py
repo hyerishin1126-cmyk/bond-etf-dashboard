@@ -8,8 +8,9 @@
     4) 한국 지수 ETF (KODEX 200, TIGER 200, KODEX 코스닥150, KODEX 200TR, TIGER 미국S&P500, TIGER 미국나스닥100)
     5) 대체 및 현금성 자산 (Gold GLDM, KODEX 단기채권, 은대 2.53%)
 - 기간 조회:
-    - 기준 시작일: 2023-11-14 (KODEX 국고채10년액티브 471230 상장일) — 이전 날짜는 선택 불가
-    - 프리셋: 상장 이후 전체 / 최근 2년 / 최근 1년 / 연초 이후(YTD) / 사용자 직접 지정
+    - 날짜는 2000-01-01부터 전체 구간 선택 가능
+    - 실제 조회 시작일은 선택 종목 중 가장 늦게 상장한 종목의 상장일(데이터 첫 거래일)로 자동 보정 + 안내 팝업
+    - 프리셋: 전체 기간 / 최근 2년 / 최근 1년 / 연초 이후(YTD) / 사용자 직접 지정
     - 1년 미만 구간은 단기 모니터링 모드(기간 누적 수익률 중심)로 자동 전환
 - 투자비중:
     - 미국 국고채 0~100%
@@ -151,29 +152,29 @@ KR_LISTED_US_FX = {"360750.KS", "133690.KS", "379800.KS"}
 ALL_NAMES = {**US_BOND, **KR_BOND, **US_EQUITY, **KR_EQUITY, **CASH_OPTS,
              "GLDM": "SPDR Gold MiniShares", "SPY": US_EQUITY["SPY"]}
 
-# ── 분석 기간 기준일 ──
-# 기본 편입 종목 KODEX 국고채10년액티브(471230)의 상장일. 이 날짜 이전은 선택할 수 없다.
-LISTING_DATE = date(2023, 11, 14)
-LISTING_LABEL = "KODEX 국고채10년액티브(471230)"
-LATE_LISTING_GRACE_DAYS = 7   # 연휴 등으로 첫 거래일이 밀리는 정도는 '늦은 상장'으로 보지 않음
+# ── 분석 기간 ──
+# 날짜 선택은 전체 구간을 허용하고, 실제 조회 시작일은 '선택 종목 중 가장 늦게 상장한 종목'의
+# 상장일(=데이터 첫 거래일)로 자동 보정한다.
+DATA_FLOOR = date(2000, 1, 1)   # 날짜 선택기에서 고를 수 있는 가장 이른 날짜
+PARTIAL_YEAR_GRACE_DAYS = 7     # 연초 휴장으로 첫 거래일이 며칠 밀린 해는 '전체 연도'로 취급
 
-PRESET_SINCE_LISTING = f"상장 이후 전체 ({LISTING_DATE:%Y-%m-%d} ~ 현재)"
+PRESET_ALL = "전체 기간 (선택 종목 공통 시작일 ~ 현재)"
 PRESET_2Y = "최근 2년"
 PRESET_1Y = "최근 1년"
 PRESET_YTD = "연초 이후 (YTD)"
 PRESET_CUSTOM = "사용자 직접 지정"
-PERIOD_PRESETS = [PRESET_SINCE_LISTING, PRESET_2Y, PRESET_1Y, PRESET_YTD, PRESET_CUSTOM]
+PERIOD_PRESETS = [PRESET_ALL, PRESET_2Y, PRESET_1Y, PRESET_YTD, PRESET_CUSTOM]
 
 
 def clamp_period_date(d: date, today: date) -> date:
-    """선택 가능한 범위 [LISTING_DATE, today] 안으로 보정."""
-    return min(max(d, LISTING_DATE), today)
+    """선택 가능한 범위 [DATA_FLOOR, today] 안으로 보정."""
+    return min(max(d, DATA_FLOOR), today)
 
 
 def preset_date_range(preset: str, today: date) -> tuple[date, date] | None:
     """프리셋별 (시작일, 종료일). '사용자 직접 지정'은 None (현재 선택값 유지)."""
-    if preset == PRESET_SINCE_LISTING:
-        start = LISTING_DATE
+    if preset == PRESET_ALL:
+        start = DATA_FLOOR          # 실행 시 가장 늦게 상장한 종목의 상장일로 보정됨
     elif preset == PRESET_2Y:
         start = today - timedelta(days=730)
     elif preset == PRESET_1Y:
@@ -185,21 +186,27 @@ def preset_date_range(preset: str, today: date) -> tuple[date, date] | None:
     return clamp_period_date(start, today), today
 
 
-def yearly_labels(years: pd.Index, start: pd.Timestamp, end: pd.Timestamp) -> tuple[list[str], list[str]]:
+def display_name(t: str) -> str:
+    """팝업·안내용 종목 표기: 'KODEX 국고채10년액티브'(471230)"""
+    code = t.replace(".KS", "").replace(".KQ", "")
+    name = ALL_NAMES.get(t, code).split(" (")[0]
+    return f"'{name}'({code})" if name != code else f"'{code}'"
+
+
+def yearly_labels(years: pd.Index, start: pd.Timestamp, end: pd.Timestamp,
+                  start_is_listing: bool = False) -> tuple[list[str], list[str]]:
     """
     연도별 수익률 표의 행 이름과 행별 비고 (전체 연도면 빈 문자열).
-    - 첫 해가 연중에 시작하면 '2023년* (상장 이후)'처럼 표시 (해당 구간의 기간 수익률)
+    - 첫 해가 연중에 시작하면 '2023년* (상장 이후)' 또는 '2025년* (11-06 이후)'로 표시
     - 마지막 해가 연중에 끝나면 '2026년† (YTD)'로 표시
     """
     labels, notes = [], []
-    listing_ts = pd.Timestamp(LISTING_DATE)
     for yr in years:
         yr = int(yr)
-        first_partial = yr == start.year and start > pd.Timestamp(yr, 1, 1) + pd.Timedelta(days=LATE_LISTING_GRACE_DAYS)
+        first_partial = yr == start.year and start > pd.Timestamp(yr, 1, 1) + pd.Timedelta(days=PARTIAL_YEAR_GRACE_DAYS)
         last_partial = yr == end.year and end < pd.Timestamp(yr, 12, 24)
         if first_partial:
-            near_listing = abs((start - listing_ts).days) <= LATE_LISTING_GRACE_DAYS
-            tag = "상장 이후" if near_listing else f"{start:%m-%d} 이후"
+            tag = "상장 이후" if start_is_listing else f"{start:%m-%d} 이후"
             labels.append(f"{yr}년* ({tag})")
             year_end = min(end, pd.Timestamp(yr, 12, 31))
             notes.append(f"* {yr}년은 전체 연도가 아닌 {start:%Y-%m-%d} ~ {year_end:%Y-%m-%d} 구간의 기간 수익률입니다.")
@@ -210,6 +217,22 @@ def yearly_labels(years: pd.Index, start: pd.Timestamp, end: pd.Timestamp) -> tu
             labels.append(f"{yr}년")
             notes.append("")
     return labels, notes
+
+
+def show_start_adjust_popup(message: str):
+    """조회 시작일 보정 팝업 (Streamlit 버전에 따라 st.dialog → experimental_dialog → 경고 박스)."""
+    dialog = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+    if dialog is None:
+        st.warning(f"📅 {message}")
+        return
+
+    @dialog("📅 조회 시작일 수정")
+    def _popup():
+        st.write(message)
+        if st.button("확인", type="primary", use_container_width=True):
+            st.rerun()
+
+    _popup()
 
 
 BANK_RATE = 0.0253          # 은대 연 금리
@@ -571,9 +594,10 @@ def _calc_weights(params: dict, available: list[str]) -> tuple[dict[str, float],
 #  BACKTEST ENGINE & ATTRIBUTION BREAKDOWN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def run_backtest(params: dict) -> dict | None:
-    start_ts = pd.Timestamp(params["start_date"])
+    start_req = pd.Timestamp(params["start_date"])
     end_ts = pd.Timestamp(params["end_date"])
-    s_str, e_str = start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d")
+    e_str = end_ts.strftime("%Y-%m-%d")
+    floor_str = DATA_FLOOR.strftime("%Y-%m-%d")     # 상장일 파악을 위해 항상 전체 이력 조회 (종목별 캐시)
 
     # ── 0. 편입 후보 (비중 0% 자산군은 공통 구간을 줄이지 않도록 제외) ──
     w_raw = {
@@ -608,13 +632,16 @@ def run_backtest(params: dict) -> dict | None:
     # ── 1. 시세 + 분배금 수집 (⑥ 총수익 직접 산출) ──
     raw: dict[str, pd.DataFrame] = {}
     for t in sorted(set(market_tk + ["SPY"])):
-        df = fetch_raw(t, s_str, e_str)
+        df = fetch_raw(t, floor_str, e_str)
         if not df.empty:
             raw[t] = df
 
     missing = [t for t in market_tk if t not in raw]
     if missing:
-        st.warning(f"⚠️ 다음 종목 데이터 부재로 제외: {', '.join(missing)}")
+        st.warning(
+            f"⚠️ 조회 종료일({end_ts:%Y-%m-%d})까지 데이터가 없어 제외한 종목(상장 전이거나 시세 조회 실패): "
+            f"{', '.join(display_name(t) for t in missing)}"
+        )
     avail_mkt = [t for t in market_tk if t in raw]
     pt = avail_mkt + (["BANK_DEPOSIT"] if "BANK_DEPOSIT" in group else [])
     if not pt:
@@ -624,6 +651,37 @@ def run_backtest(params: dict) -> dict | None:
     tr: dict[str, pd.Series] = {}
     for t, df in raw.items():
         tr[t] = build_total_return(df)
+
+    # ── 1-1. 조회 시작일 보정: 선택 종목 중 가장 늦게 상장한 종목 기준 ──
+    #   상장일 = 데이터 첫 거래일. 달러 자산이 있으면 USD/KRW 환율 데이터 시작일도 함께 고려.
+    fx_df = fetch_raw("KRW=X", floor_str, e_str)
+    first_dates: dict[str, pd.Timestamp] = {t: raw[t].index[0] for t in avail_mkt}
+    if any(t in us_set for t in avail_mkt) and not fx_df.empty:
+        first_dates["KRW=X"] = fx_df.index[0]
+
+    start_ts = start_req
+    start_adjustment = None
+    if first_dates:
+        latest = max(first_dates.values())
+        if latest > start_req:
+            causes = [t for t, d in first_dates.items() if d == latest]
+            stock_causes = [t for t in causes if t != "KRW=X"]
+            if stock_causes:
+                who = ", ".join(display_name(t) for t in stock_causes)
+                message = f"{who} 상장일이 {latest:%Y-%m-%d} 이므로 조회 시작일을 수정했습니다."
+            else:
+                message = f"USD/KRW 환율 데이터 시작일이 {latest:%Y-%m-%d} 이므로 조회 시작일을 수정했습니다."
+            start_ts = latest
+            start_adjustment = {
+                "requested": start_req.date(), "new_start": latest.date(),
+                "causes": causes, "message": message,
+            }
+            if start_ts >= end_ts:
+                st.error(
+                    f"❌ {message.replace(' 이므로 조회 시작일을 수정했습니다.', '')}로, 조회 종료일"
+                    f"({end_ts:%Y-%m-%d}) 이후입니다. 종료일을 늦추거나 종목을 변경하세요."
+                )
+                return None
 
     # ── 2. 기준 캘린더 (② 한국 종목이 있으면 한국 영업일) ──
     kr_mkt = [t for t in avail_mkt if is_kr_ticker(t)]
@@ -658,37 +716,6 @@ def run_backtest(params: dict) -> dict | None:
         st.error("❌ 분석에 필요한 유효 거래일 데이터가 2일 미만입니다. 기간을 조금 더 넓혀주세요.")
         return None
 
-    # 구간 축소 알림: 선택한 시작일 이후 '늦게 상장된' 종목 때문에 공통 시작일이 밀린 경우에만 노출.
-    # (시작일이 휴장일이라 첫 거래일이 하루이틀 밀리는 정상 케이스에서는 띄우지 않음)
-    market_first: dict[str, pd.Timestamp] = {}
-    for t, df in raw.items():
-        mk = "KR" if is_kr_ticker(t) else "US"
-        d_in = df.index[df.index >= start_ts]
-        if len(d_in):
-            market_first[mk] = min(market_first.get(mk, d_in[0]), d_in[0])
-    late_listed: list[tuple[str, pd.Timestamp]] = []
-    for t in avail_mkt:
-        d_in = raw[t].index[raw[t].index >= start_ts]
-        if not len(d_in):
-            continue
-        own_first = d_in[0]
-        mk = "KR" if is_kr_ticker(t) else "US"
-        # 같은 시장 다른 종목보다 3일 넘게 늦게 시작 (하루짜리 데이터 결측은 무시)
-        later_than_peers = (own_first - market_first.get(mk, own_first)).days > 3
-        beyond_holiday_gap = (own_first - start_ts).days > LATE_LISTING_GRACE_DAYS
-        if later_than_peers or beyond_holiday_gap:
-            late_listed.append((t, own_first))
-
-    if late_listed and first_valid > start_ts:
-        late_txt = ", ".join(
-            f"{t.replace('.KS', '')}({ALL_NAMES.get(t, t)}, 첫 거래 {d:%Y-%m-%d})" for t, d in late_listed
-        )
-        st.info(
-            f"ℹ️ 선택한 시작일({start_ts:%Y-%m-%d}) 이후 상장된 종목이 있어 실제 공통 백테스팅 구간이 "
-            f"**{first_valid:%Y-%m-%d}** ~ **{last_valid:%Y-%m-%d}** 로 조정되었습니다. "
-            f"원인 종목: {late_txt}"
-        )
-
     # 은대: 실제 경과 달력일로 일할 (② 252 가정 제거)
     if "BANK_DEPOSIT" in pt:
         elapsed = (prices.index - prices.index[0]).days.to_numpy(dtype="float64")
@@ -700,7 +727,6 @@ def run_backtest(params: dict) -> dict | None:
     periods_per_year = calc_periods_per_year(idx)
 
     # ── 3. 환율 ──
-    fx_df = fetch_raw("KRW=X", (first_valid - pd.Timedelta(days=15)).strftime("%Y-%m-%d"), e_str)
     has_fx = not fx_df.empty
     if has_fx:
         fx_lvl = fx_df["close"].reindex(idx, method="ffill", tolerance=ASOF_TOLERANCE).ffill().bfill()
@@ -765,10 +791,9 @@ def run_backtest(params: dict) -> dict | None:
     taa_signal = pd.Series(0.0, index=returns.index)
     taa_days_rsi = 0
     if params["rsi_taa_enabled"]:
-        warm_start = (first_valid - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-        spy_raw = fetch_raw("SPY", warm_start, e_str)
-        if not spy_raw.empty:
-            spy_tr = build_total_return(spy_raw)
+        if "SPY" in tr:
+            # 전체 이력에서 시작일 120일 전부터 사용 (RSI 워밍업)
+            spy_tr = tr["SPY"].loc[first_valid - pd.Timedelta(days=120):end_ts]
             spy_rsi = calc_rsi(spy_tr, params["rsi_period"])      # 미국 영업일 그대로 계산
             sig_native = compute_rsi_signal(
                 spy_rsi, params["rsi_entry"], params["rsi_exit"], params["rsi_max_days"]
@@ -913,6 +938,8 @@ def run_backtest(params: dict) -> dict | None:
         "avg_carry_pa":         avg_carry_pa,
         "hedge_ratio":          params["hedge_ratio"],
         "taa_days_rsi":         taa_days_rsi,
+        "start_adjustment":     start_adjustment,
+        "requested_start":      start_req.date(),
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -933,19 +960,23 @@ def render_sidebar() -> tuple[dict, bool]:
         st.divider()
         st.header("⚙️ 시뮬레이션 파라미터")
 
-        # ── 1. 분석 기간 (상장일 2023-11-14 기준, 프리셋 ↔ 날짜 선택기 동기화) ──
+        # ── 1. 분석 기간 (전체 구간 선택 가능, 실행 시 가장 늦게 상장한 종목 기준으로 시작일 보정) ──
         with st.expander("📅 분석 기간 설정", expanded=True):
             today = date.today()
             ss = st.session_state
 
-            # 최초 진입(또는 로그아웃 후) 기본값: 상장 이후 전체
+            # 최초 진입(또는 로그아웃 후) 기본값: 전체 기간
             if ss.get("period_preset") not in PERIOD_PRESETS:
-                ss["period_preset"] = PRESET_SINCE_LISTING
+                ss["period_preset"] = PRESET_ALL
             if "period_start" not in ss or "period_end" not in ss:
-                init = preset_date_range(ss["period_preset"], today) or (LISTING_DATE, today)
+                init = preset_date_range(ss["period_preset"], today) or (DATA_FLOOR, today)
                 ss["period_start"], ss["period_end"] = init
 
-            # 유효성 검증: 저장된 값이 상장일 이전·오늘 이후로 벗어나지 않도록 위젯 생성 전에 보정
+            # 직전 실행에서 보정된 조회 시작일을 위젯 생성 전에 반영
+            if "_pending_period_start" in ss:
+                ss["period_start"] = ss.pop("_pending_period_start")
+
+            # 유효성 검증: 선택 가능 범위 [DATA_FLOOR, 오늘] 안으로 보정
             ss["period_start"] = clamp_period_date(ss["period_start"], today)
             ss["period_end"] = clamp_period_date(ss["period_end"], today)
 
@@ -958,16 +989,16 @@ def render_sidebar() -> tuple[dict, bool]:
                 # 날짜를 직접 바꾸면 프리셋 표시를 '사용자 직접 지정'으로 전환
                 st.session_state["period_preset"] = PRESET_CUSTOM
 
-            st.selectbox(
+            preset = st.selectbox(
                 "⚡ 간편 기간 프리셋", PERIOD_PRESETS,
                 key="period_preset", on_change=_on_preset_change,
             )
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
-                start_date = st.date_input(
+                shown_start = st.date_input(
                     "시작일",
-                    min_value=LISTING_DATE,
+                    min_value=DATA_FLOOR,
                     max_value=today,
                     key="period_start",
                     on_change=_on_date_change,
@@ -975,16 +1006,22 @@ def render_sidebar() -> tuple[dict, bool]:
             with col_d2:
                 end_date = st.date_input(
                     "종료일",
-                    min_value=LISTING_DATE,
+                    min_value=DATA_FLOOR,
                     max_value=today,
                     key="period_end",
                     on_change=_on_date_change,
                 )
             st.caption(
-                f"※ 국내 국고채10년액티브 ETF(471230) 상장일({LISTING_DATE:%Y-%m-%d}) 이후 전체 유효 구간입니다."
+                "※ 실제 조회 시작일은 선택한 종목 중 **가장 늦게 상장한 종목의 상장일**로 자동 보정됩니다. "
+                "보정되면 시작일 칸이 바뀌고 안내 팝업이 뜹니다."
             )
 
-            if start_date >= end_date:
+            # 프리셋을 쓰는 동안에는 '프리셋이 뜻하는 시작일'로 요청한다.
+            # (예: 전체 기간 → 종목을 바꾸면 그 조합의 가장 이른 공통 시작일로 다시 계산됨)
+            preset_rng = preset_date_range(preset, today)
+            start_date = preset_rng[0] if preset_rng is not None else shown_start
+
+            if shown_start >= end_date:
                 st.error("⚠️ 시작일은 종료일보다 이전이어야 합니다.")
 
         # ── 2. 투자대상 선택 (채권 & 지수 ETF) ──
@@ -1070,7 +1107,7 @@ def render_sidebar() -> tuple[dict, bool]:
             ta_years: list[int] = []
             if ta_on:
                 st.caption("⚠️ 연도를 사후에 고르는 방식이라 결과에 hindsight bias가 포함됩니다.")
-                yr_range = list(range(LISTING_DATE.year, date.today().year + 1))
+                yr_range = list(range(DATA_FLOOR.year, date.today().year + 1))
                 ta_years = st.multiselect("적극 투자 국면 연도 선택", yr_range, default=[])
 
         # ── 7. 환율 및 통화 비교 제어 ──
@@ -1141,6 +1178,9 @@ def render_dashboard(res: dict, show_hedged: bool):
 
     is_short = res.get("is_short_term", False)
     trading_days = res.get("trading_days", 0)
+    _adj = res.get("start_adjustment")
+    # 분석 시작일이 상장일 보정으로 정해졌으면 첫 해를 '상장 이후'로 표기
+    start_is_listing = bool(_adj) and abs((res["analysis_start"] - pd.Timestamp(_adj["new_start"])).days) <= PARTIAL_YEAR_GRACE_DAYS
     total_days = res.get("total_days", 0)
     ppy = res.get("periods_per_year", 252.0)
 
@@ -1148,6 +1188,10 @@ def render_dashboard(res: dict, show_hedged: bool):
         f"분석 데이터 구간: **{p_start} ~ {p_end}** ({total_days}일, {trading_days}영업일) | "
         f"기준 캘린더: **{res.get('calendar_label', '-')}** (연 {ppy:.0f}회 관측) | 통화 기준: **KRW (원화)**"
     )
+
+    adj = res.get("start_adjustment")
+    if adj:
+        st.caption(f"📅 {adj['message']} (요청 시작일 {adj['requested']:%Y-%m-%d} → {adj['new_start']:%Y-%m-%d})")
 
     if is_short:
         st.markdown(
@@ -1358,8 +1402,8 @@ def render_dashboard(res: dict, show_hedged: bool):
         })
         if show_hedged:
             yearly["환헤지 100%"] = res["yearly_hedged"].round(2)
-        yearly = yearly[yearly.index >= LISTING_DATE.year]
-        y_labels, y_notes = yearly_labels(yearly.index, res["analysis_start"], res["analysis_end"])
+        y_labels, y_notes = yearly_labels(yearly.index, res["analysis_start"], res["analysis_end"],
+                                          start_is_listing=start_is_listing)
         yearly.index = pd.Index(y_labels, name="연도")
         st.dataframe(yearly, use_container_width=True)
         for note in y_notes:
@@ -1396,9 +1440,10 @@ def render_dashboard(res: dict, show_hedged: bool):
         "NAV_환헤지100": res["nav_hedged"].values.round(4),
         "NAV_벤치마크": res["nav_benchmark"].values.round(4),
     })
-    yp = res["yearly_portfolio"][res["yearly_portfolio"].index >= LISTING_DATE.year]
+    yp = res["yearly_portfolio"]
     yb = res["yearly_benchmark"].reindex(yp.index)
-    exp_labels, exp_notes = yearly_labels(yp.index, res["analysis_start"], res["analysis_end"])
+    exp_labels, exp_notes = yearly_labels(yp.index, res["analysis_start"], res["analysis_end"],
+                                          start_is_listing=start_is_listing)
     yearly_exp = pd.DataFrame({
         "연도":            exp_labels,
         "혼합형펀드(%)":    yp.values.round(2),
@@ -1438,6 +1483,10 @@ def main():
 
     params, run_clicked = render_sidebar()
 
+    popup_msg = st.session_state.pop("_start_adjust_popup", None)
+    if popup_msg:
+        show_start_adjust_popup(popup_msg)
+
     if run_clicked:
         if params["start_date"] >= params["end_date"]:
             st.error("❌ 시작일은 종료일보다 이전이어야 합니다. 사이드바에서 기간을 다시 선택하세요.")
@@ -1459,6 +1508,15 @@ def main():
             st.session_state["results"] = results
             st.session_state["show_hedged"] = params["show_hedged_line"]
 
+            # 실제 적용된 조회 시작일을 사이드바 시작일 칸에 반영 (위젯 생성 전에 넣어야 하므로 rerun)
+            adj = results.get("start_adjustment")
+            effective_start = adj["new_start"] if adj else results["requested_start"]
+            if effective_start != st.session_state.get("period_start"):
+                st.session_state["_pending_period_start"] = effective_start
+                if adj:
+                    st.session_state["_start_adjust_popup"] = adj["message"]
+                st.rerun()
+
     if "results" in st.session_state:
         render_dashboard(
             st.session_state["results"],
@@ -1466,7 +1524,7 @@ def main():
         )
     else:
         st.markdown("## 🏛️ 국채·지수 ETF 혼합형 펀드 퀀트 백테스팅 대시보드")
-        st.info(f"👈 좌측 사이드바에서 **분석 기간(기본: 상장 이후 전체 {LISTING_DATE:%Y-%m-%d} ~ 현재) 및 ETF 비중**을 설정하고 **🚀 시뮬레이션 재실행** 버튼을 누르세요.")
+        st.info("👈 좌측 사이드바에서 **분석 기간(기본: 전체 기간 — 선택 종목 중 가장 늦게 상장한 종목의 상장일부터) 및 ETF 비중**을 설정하고 **🚀 시뮬레이션 재실행** 버튼을 누르세요.")
         st.markdown(
             """
             ### 🎯 목표수익률 8%대 펀드 포트폴리오 구조
