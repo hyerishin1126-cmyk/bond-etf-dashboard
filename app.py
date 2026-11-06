@@ -3,7 +3,7 @@
 =====================================================
 - 투자대상:
     1) 미국 국고채 ETF (SGOV, SHY, IEI, IEF, TLT, GOVT)
-    2) 한국 국고채 ETF (KODEX 3년, KODEX 10년액티브, KODEX 30년액티브, KOSEF 10년, TIGER 10년)
+    2) 한국 국고채 ETF (KODEX 3년, KODEX 10년액티브, KODEX 30년액티브, KOSEF 10년)
     3) 미국 지수 ETF (SPY, VOO, IVV, QQQ, QQQM, DIA)
     4) 한국 지수 ETF (KODEX 200, TIGER 200, KODEX 코스닥150, KODEX 200TR, TIGER 미국S&P500, TIGER 미국나스닥100)
     5) 대체 및 현금성 자산 (Gold GLDM, KODEX 단기채권, 은대 2.53%)
@@ -120,7 +120,15 @@ KR_BOND = {
     "471230.KS": "KODEX 국고채10년액티브",
     "439870.KS": "KODEX 국고채30년액티브",
     "148070.KS": "KOSEF 국고채10년",
-    "305080.KS": "TIGER 국고채10년",
+}
+
+# 공식 상장일 (조회 시작일 보정·팝업 안내에 사용).
+# 여기에 없는 종목은 시세 데이터의 첫 거래일을 상장일로 간주한다.
+LISTING_DATES: dict[str, date] = {
+    "114260.KS": date(2009, 7, 28),    # KODEX 국고채3년
+    "148070.KS": date(2011, 10, 20),   # KOSEF 국고채10년
+    "439870.KS": date(2022, 8, 23),    # KODEX 국고채30년액티브
+    "471230.KS": date(2023, 11, 14),   # KODEX 국고채10년액티브
 }
 
 US_EQUITY = {
@@ -694,33 +702,50 @@ def run_backtest(params: dict) -> dict | None:
         tr[t] = build_total_return(df)
 
     # ── 1-1. 조회 시작일 보정: 선택 종목 중 가장 늦게 상장한 종목 기준 ──
-    #   상장일 = 데이터 첫 거래일. 달러 자산이 있으면 USD/KRW 환율 데이터 시작일도 함께 고려.
+    #   상장일 = LISTING_DATES의 공식 상장일 (없으면 시세 데이터 첫 거래일).
+    #   실제 분석 가능일 = max(상장일, 데이터 첫 거래일) — 시세 데이터가 상장일보다 늦게 시작하는 경우 대비.
+    #   달러 자산이 있으면 USD/KRW 환율 데이터 시작일도 함께 고려.
     fx_df = fetch_raw("KRW=X", floor_str, e_str)
-    first_dates: dict[str, pd.Timestamp] = {t: raw[t].index[0] for t in avail_mkt}
+    listing_info: dict[str, tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = {}   # (상장일, 데이터 첫날, 분석 가능일)
+    for t in avail_mkt:
+        data_first = raw[t].index[0]
+        listed = pd.Timestamp(LISTING_DATES[t]) if t in LISTING_DATES else data_first
+        listing_info[t] = (listed, data_first, max(listed, data_first))
     if any(t in us_set for t in avail_mkt) and not fx_df.empty:
-        first_dates["KRW=X"] = fx_df.index[0]
+        fx_first = fx_df.index[0]
+        listing_info["KRW=X"] = (fx_first, fx_first, fx_first)
 
     start_ts = start_req
     start_adjustment = None
-    if first_dates:
-        latest = max(first_dates.values())
+    if listing_info:
+        latest = max(v[2] for v in listing_info.values())
         if latest > start_req:
-            causes = [t for t, d in first_dates.items() if d == latest]
+            causes = [t for t, v in listing_info.items() if v[2] == latest]
             stock_causes = [t for t in causes if t != "KRW=X"]
             if stock_causes:
-                who = ", ".join(display_name(t) for t in stock_causes)
-                message = f"{who} 상장일이 {latest:%Y-%m-%d} 이므로 조회 시작일을 수정했습니다."
+                listed_dates = {listing_info[t][0] for t in stock_causes}
+                if len(listed_dates) == 1:
+                    who = ", ".join(display_name(t) for t in stock_causes)
+                    reason = f"{who} 상장일이 {next(iter(listed_dates)):%Y-%m-%d}"
+                else:
+                    reason = ", ".join(f"{display_name(t)} 상장일이 {listing_info[t][0]:%Y-%m-%d}" for t in stock_causes)
+                message = f"{reason} 이므로 조회 시작일을 수정했습니다."
+                lagged = [t for t in stock_causes if (listing_info[t][1] - listing_info[t][0]).days > 7]
+                if lagged:
+                    message += f" (단, 시세 데이터가 {latest:%Y-%m-%d}부터 제공되어 그날부터 분석합니다.)"
             else:
-                message = f"USD/KRW 환율 데이터 시작일이 {latest:%Y-%m-%d} 이므로 조회 시작일을 수정했습니다."
+                reason = f"USD/KRW 환율 데이터 시작일이 {latest:%Y-%m-%d}"
+                message = f"{reason} 이므로 조회 시작일을 수정했습니다."
             start_ts = latest
             start_adjustment = {
                 "requested": start_req.date(), "new_start": latest.date(),
                 "causes": causes, "message": message,
+                "listing_dates": {t: listing_info[t][0].date() for t in causes},
             }
             if start_ts >= end_ts:
                 st.error(
-                    f"❌ {message.replace(' 이므로 조회 시작일을 수정했습니다.', '')}로, 조회 종료일"
-                    f"({end_ts:%Y-%m-%d}) 이후입니다. 종료일을 늦추거나 종목을 변경하세요."
+                    f"❌ {reason}로, 조회 종료일({end_ts:%Y-%m-%d})보다 늦습니다. "
+                    f"종료일을 늦추거나 종목을 변경하세요."
                 )
                 return None
 
@@ -1185,7 +1210,10 @@ def render_sidebar() -> tuple[dict, bool]:
             st.caption("🇰🇷 **한국 국고채 ETF** (.KS 자동 매핑)")
             kr_bonds = st.multiselect(
                 "한국 국고채", list(KR_BOND.keys()), default=["471230.KS"],
-                format_func=lambda x: f"{x.replace('.KS','')} - {KR_BOND[x]}",
+                format_func=lambda x: (
+                    f"{x.replace('.KS','')} - {KR_BOND[x]}"
+                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                ),
                 label_visibility="collapsed",
             )
 
@@ -1458,7 +1486,7 @@ EXPORT_ASSUMPTIONS = [
     "공모주 Alpha는 사용자가 입력한 연간 가정치를 달력일 기준으로 일할 가산한 값 (실제 공모주 성과 아님).",
     "은대(BANK_DEPOSIT)는 연 2.53% 고정 금리를 달력일 기준(ACT/365)으로 일할한 합성 자산.",
     "샤프 지수의 무위험수익률은 연 3% 고정.",
-    "조회 시작일은 선택 종목 중 가장 늦게 상장한 종목의 데이터 첫 거래일(또는 USD/KRW 데이터 시작일)로 자동 보정됨.",
+    "조회 시작일은 선택 종목 중 가장 늦게 상장한 종목의 상장일(공식 상장일이 등록된 종목은 그 날짜, 그 외는 시세 데이터 첫 거래일) 또는 USD/KRW 데이터 시작일로 자동 보정됨.",
 ]
 
 
