@@ -348,39 +348,79 @@ def _asof(s: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
     return out.bfill().ffill()
 
 
-def get_rate_series(index: pd.DatetimeIndex, mode: str,
-                    manual_kr: float, manual_us: float) -> tuple[pd.Series, pd.Series, str]:
-    """원화·달러 단기금리(연 %)를 index 위에 as-of 정렬. 실패 시 수동값."""
-    notes = []
-    kr = us = None
-    if mode == "자동":
-        start = (index[0] - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-        end = index[-1].strftime("%Y-%m-%d")
-        irx = fetch_raw("^IRX", start, end)
-        if not irx.empty:
-            us = irx["close"]
-            notes.append("USD 3M: ^IRX(미 T-bill 13주)")
-        else:
-            fr = fetch_fred_series(FRED_USD_3M)
-            if not fr.empty:
-                us = fr
-                notes.append(f"USD 3M: FRED {FRED_USD_3M}")
-        k = fetch_fred_series(FRED_KRW_3M)
-        if not k.empty:
-            kr = k
-            lag_days = (index[-1] - k.index[-1]).days
-            stale = f", 최근 {lag_days}일은 마지막 월값 유지" if lag_days > 45 else ""
-            notes.append(f"KRW 3M: FRED {FRED_KRW_3M}(월별{stale})")
+def fetch_auto_rates(end: str) -> dict[str, tuple[pd.Series, str, str]]:
+    """
+    자동 금리 원자료 조회. 반환: {"KRW"/"USD": (연 % 시계열, 출처, 자료 주기)}
+    - USD: ^IRX(미 T-bill 13주, 일별) → 실패 시 FRED DTB3(일별)
+    - KRW: FRED IR3TIB01KRM156N (한국 3개월 금리, 월평균 · 날짜는 해당 월 1일로 표기)
+    """
+    out: dict[str, tuple[pd.Series, str, str]] = {}
+    irx = fetch_raw("^IRX", DATA_FLOOR.strftime("%Y-%m-%d"), end)
+    if not irx.empty:
+        out["USD"] = (irx["close"].sort_index(), "^IRX (미 T-bill 13주)", "일별")
+    else:
+        fr = fetch_fred_series(FRED_USD_3M)
+        if not fr.empty:
+            out["USD"] = (fr, f"FRED {FRED_USD_3M} (미 T-bill 3개월)", "일별")
+    k = fetch_fred_series(FRED_KRW_3M)
+    if not k.empty:
+        out["KRW"] = (k, f"FRED {FRED_KRW_3M} (한국 3개월 금리)", "월평균")
+    return out
 
-    if us is None:
-        us = pd.Series(manual_us, index=index)
-        notes.append(f"USD: 수동 {manual_us:.2f}%")
-    if kr is None:
-        kr = pd.Series(manual_kr, index=index)
-        notes.append(f"KRW: 수동 {manual_kr:.2f}%")
-    if mode == "자동" and any("수동" in n for n in notes):
-        notes.append("⚠️ 자동 조회 일부 실패 → 수동값 대체")
-    return _asof(kr, index), _asof(us, index), " · ".join(notes)
+
+def get_rate_series(index: pd.DatetimeIndex, mode: str, manual_kr: float,
+                    manual_us: float) -> tuple[pd.Series, pd.Series, str, dict]:
+    """
+    원화·달러 단기금리(연 %)를 index 위에 as-of 정렬. 자동 조회 실패 시 수동값.
+    반환: (원화 금리, 달러 금리, 출처 요약 문자열, 상세 정보 dict)
+    """
+    auto = fetch_auto_rates(index[-1].strftime("%Y-%m-%d")) if mode == "자동" else {}
+    series: dict[str, pd.Series] = {}
+    info: dict[str, dict] = {}
+    manual_vals = {"KRW": manual_kr, "USD": manual_us}
+
+    for ccy in ("KRW", "USD"):
+        if ccy in auto:
+            raw_s, src, freq = auto[ccy]
+            used = raw_s[raw_s.index <= index[-1]]        # 분석 종료일까지만 사용
+            if used.empty:
+                used = raw_s
+            aligned = _asof(used, index)
+            # 월평균 자료는 그 달 말일까지 유효한 값으로 보고 경과일 계산
+            covered_to = used.index[-1] + pd.offsets.MonthEnd(0) if freq == "월평균" else used.index[-1]
+            lag_days = max((index[-1] - covered_to).days, 0)
+            info[ccy] = {
+                "출처": src, "주기": freq, "수동값 사용": False,
+                "원자료 최신 기준일": used.index[-1].date(),
+                "원자료 최신값(%)": float(used.iloc[-1]),
+                "최신값 경과일": lag_days,
+            }
+        else:
+            aligned = pd.Series(manual_vals[ccy], index=index, dtype="float64")
+            src = "수동 입력" + (" (자동 조회 실패)" if mode == "자동" else "")
+            info[ccy] = {
+                "출처": src, "주기": "고정", "수동값 사용": True,
+                "원자료 최신 기준일": None, "원자료 최신값(%)": manual_vals[ccy], "최신값 경과일": 0,
+            }
+        info[ccy].update({
+            "분석 시작일 값(%)": float(aligned.iloc[0]),
+            "분석 종료일 값(%)": float(aligned.iloc[-1]),
+            "기간 평균(%)": float(aligned.mean()),
+            "기간 최저(%)": float(aligned.min()),
+            "기간 최고(%)": float(aligned.max()),
+        })
+        series[ccy] = aligned
+
+    parts = []
+    for ccy, label in (("KRW", "원화"), ("USD", "달러")):
+        d = info[ccy]
+        if d["수동값 사용"]:
+            parts.append(f"{label} {d['원자료 최신값(%)']:.2f}% ({d['출처']})")
+        else:
+            parts.append(f"{label} {d['원자료 최신값(%)']:.2f}% ({d['출처']}, {d['원자료 최신 기준일']:%Y-%m-%d} {d['주기']})")
+    if mode == "자동" and any(info[c]["수동값 사용"] for c in info):
+        parts.append("⚠️ 자동 조회 일부 실패 → 수동값 대체")
+    return series["KRW"], series["USD"], " · ".join(parts), info
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -738,16 +778,21 @@ def run_backtest(params: dict) -> dict | None:
     # ── 4. 헤지 carry (④) ──
     has_us = any(t in us_set for t in pt)
     if has_us:
-        kr_rate, us_rate, rate_note = get_rate_series(
+        kr_rate, us_rate, rate_note, rate_info = get_rate_series(
             idx, params["hedge_cost_mode"], params["manual_kr_rate"], params["manual_us_rate"],
         )
         # 구간 (t-1, t] 의 carry는 t-1 시점 금리 적용
         diff_prev = ((kr_rate - us_rate) / 100.0).shift(1).iloc[1:]
         carry = diff_prev * dt / DAY_COUNT
         avg_carry_pa = float(((kr_rate - us_rate)).mean())
+        rate_daily = pd.DataFrame({
+            "원화 단기금리(%)": kr_rate, "달러 단기금리(%)": us_rate,
+            "금리차 원화-달러(%p)": kr_rate - us_rate,
+        })
     else:
         carry = pd.Series(0.0, index=idx[1:])
         rate_note, avg_carry_pa = "해당 없음 (달러 자산 없음)", 0.0
+        rate_info, rate_daily = {}, pd.DataFrame()
 
     # ── 5. 일별 총수익률 (현지통화) ──
     returns = prices.pct_change().iloc[1:]
@@ -936,6 +981,9 @@ def run_backtest(params: dict) -> dict | None:
         "calendar_label":       calendar_label,
         "rate_note":            rate_note,
         "avg_carry_pa":         avg_carry_pa,
+        "rate_info":            rate_info,
+        "rate_daily":           rate_daily,
+        "hedge_cost_mode":      params["hedge_cost_mode"],
         "hedge_ratio":          params["hedge_ratio"],
         "taa_days_rsi":         taa_days_rsi,
         "start_adjustment":     start_adjustment,
@@ -1134,6 +1182,7 @@ def render_sidebar() -> tuple[dict, bool]:
                 "자동: 달러 ^IRX(미 T-bill 3M), 원화 FRED 한국 3M 금리(월별). "
                 "조회 실패 시 위 수동값을 사용합니다. 수동값은 현재 시장금리로 확인 후 입력하세요."
             )
+            st.caption("실제로 끌어온 금리 값은 결과 화면의 **💱 헤지 금리 상세**와 엑셀 '헤지금리' 시트에서 확인할 수 있습니다.")
 
         st.divider()
         run_clicked = st.button("🚀 시뮬레이션 재실행", type="primary", use_container_width=True)
@@ -1167,6 +1216,98 @@ def render_sidebar() -> tuple[dict, bool]:
         "manual_us_rate":   manual_us_rate,
     }
     return params, run_clicked
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  헤지 금리 상세 (자동 조회값 확인용)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def rate_summary_df(res: dict) -> pd.DataFrame:
+    """원화·달러 금리와 금리차의 출처·최신값·기간 통계 표."""
+    info = res.get("rate_info") or {}
+    rd = res.get("rate_daily")
+    if not info or rd is None or rd.empty:
+        return pd.DataFrame()
+    rows = []
+    for ccy, label in (("KRW", "원화 단기금리"), ("USD", "달러 단기금리")):
+        d = info[ccy]
+        rows.append({
+            "구분": label,
+            "출처": d["출처"],
+            "자료 주기": d["주기"],
+            "원자료 기준일": f"{d['원자료 최신 기준일']:%Y-%m-%d}" if d["원자료 최신 기준일"] else "-",
+            "원자료 최신값(%)": round(d["원자료 최신값(%)"], 3),
+            "분석 시작일 값(%)": round(d["분석 시작일 값(%)"], 3),
+            "분석 종료일 값(%)": round(d["분석 종료일 값(%)"], 3),
+            "기간 평균(%)": round(d["기간 평균(%)"], 3),
+            "기간 최저(%)": round(d["기간 최저(%)"], 3),
+            "기간 최고(%)": round(d["기간 최고(%)"], 3),
+        })
+    sp = rd["금리차 원화-달러(%p)"]
+    rows.append({
+        "구분": "금리차 (원화 − 달러)", "출처": "계산값", "자료 주기": "-", "원자료 기준일": "-",
+        "원자료 최신값(%)": round(rows[0]["원자료 최신값(%)"] - rows[1]["원자료 최신값(%)"], 3),
+        "분석 시작일 값(%)": round(float(sp.iloc[0]), 3),
+        "분석 종료일 값(%)": round(float(sp.iloc[-1]), 3),
+        "기간 평균(%)": round(float(sp.mean()), 3),
+        "기간 최저(%)": round(float(sp.min()), 3),
+        "기간 최고(%)": round(float(sp.max()), 3),
+    })
+    return pd.DataFrame(rows)
+
+
+def render_rate_details(res: dict):
+    """분석에 실제 사용된 헤지 금리를 확인할 수 있는 상세 패널."""
+    info = res.get("rate_info") or {}
+    rd = res.get("rate_daily")
+    if not info or rd is None or rd.empty:
+        st.caption(f"헤지 금리: {res.get('rate_note', '-')}")
+        return
+
+    used_manual = [c for c in info if info[c]["수동값 사용"]]
+    auto_failed = res.get("hedge_cost_mode") == "자동" and bool(used_manual)
+    kr_end, us_end = info["KRW"]["분석 종료일 값(%)"], info["USD"]["분석 종료일 값(%)"]
+    title = (f"💱 헤지 금리 상세 — 원화 {kr_end:.2f}% / 달러 {us_end:.2f}% "
+             f"(금리차 {kr_end - us_end:+.2f}%p, 분석 종료일 기준)")
+    with st.expander(title, expanded=auto_failed):
+        if auto_failed:
+            names = ", ".join("원화" if c == "KRW" else "달러" for c in used_manual)
+            st.warning(f"⚠️ {names} 금리는 자동 조회에 실패해 사이드바의 수동 입력값을 사용했습니다.")
+
+        st.dataframe(rate_summary_df(res), hide_index=True, use_container_width=True)
+
+        for ccy, label in (("KRW", "원화"), ("USD", "달러")):
+            d = info[ccy]
+            if not d["수동값 사용"] and d["최신값 경과일"] > 45:
+                st.caption(
+                    f"⚠️ {label} 금리 원자료의 마지막 값은 "
+                    f"{d['원자료 최신 기준일']:%Y-%m}{' 월평균' if d['주기'] == '월평균' else ''} 기준입니다. "
+                    f"그 이후 {d['최신값 경과일']}일은 이 값({d['원자료 최신값(%)']:.2f}%)을 그대로 사용했습니다."
+                )
+        st.caption(
+            "ℹ️ 원화: FRED 한국 3개월 금리는 **월평균**이며 날짜는 해당 월 1일로 표기됩니다 (그 달 내내 같은 값 적용). "
+            "달러: ^IRX는 미 T-bill 13주 할인율(연 %)입니다. "
+            "각 영업일의 헤지 손익에는 **전 영업일의 금리차**를 적용합니다."
+        )
+
+        fig_r = go.Figure()
+        fig_r.add_trace(go.Scatter(x=rd.index, y=rd["원화 단기금리(%)"], name="원화 단기금리",
+                                   line=dict(color="#1565C0", width=1.8)))
+        fig_r.add_trace(go.Scatter(x=rd.index, y=rd["달러 단기금리(%)"], name="달러 단기금리",
+                                   line=dict(color="#E65100", width=1.8)))
+        fig_r.add_trace(go.Scatter(x=rd.index, y=rd["금리차 원화-달러(%p)"], name="금리차 (원화−달러)",
+                                   line=dict(color="#6D4C41", width=1.4, dash="dot")))
+        fig_r.add_hline(y=0, line_color="#9E9E9E", line_width=1)
+        fig_r.update_layout(
+            template="plotly_white", hovermode="x unified", height=300,
+            yaxis_title="연 %", legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center"),
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+
+        st.markdown("##### 월별 사용 금리 (각 월 마지막 영업일 값)")
+        monthly = rd.resample("ME").last().dropna(how="all")
+        monthly.index = monthly.index.strftime("%Y-%m")
+        monthly.index.name = "월"
+        st.dataframe(monthly.round(3).iloc[::-1], use_container_width=True, height=260)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN DASHBOARD DISPLAY
@@ -1312,7 +1453,7 @@ def render_dashboard(res: dict, show_hedged: bool):
         margin=dict(l=20, r=20, t=40, b=20),
     )
     st.plotly_chart(fig_attr, use_container_width=True)
-    st.caption(f"헤지 금리 출처: {res.get('rate_note', '-')}")
+    render_rate_details(res)
 
     st.divider()
 
@@ -1462,6 +1603,12 @@ def render_dashboard(res: dict, show_hedged: bool):
         attr_df.to_excel(w, sheet_name="목표수익률기여도분해", index=False)
         yearly_exp.to_excel(w, sheet_name="연도별수익률", index=False)
         nav_df.to_excel(w, sheet_name="일별NAV", index=False)
+        rate_sum = rate_summary_df(res)
+        if not rate_sum.empty:
+            rate_sum.to_excel(w, sheet_name="헤지금리요약", index=False)
+            rd_exp = res["rate_daily"].round(4).reset_index()
+            rd_exp.columns = ["Date"] + list(res["rate_daily"].columns)
+            rd_exp.to_excel(w, sheet_name="헤지금리(일별)", index=False)
 
     st.download_button(
         label="📥 엑셀 다운로드 (국채_ETF_혼합형펀드_백테스팅_결과.xlsx)",
