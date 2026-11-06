@@ -37,9 +37,7 @@
    - 자동: 달러 ^IRX(미 T-bill 3M), 원화 FRED IR3TIB01KRM156N(한국 3M 금리) / 실패 시 수동값
 ⑤ 성과 기여도 분해: 일별 기여도 × 직전 NAV 가중으로 연결(linking) → 항목 합계 = 총 수익률 정확히 일치
    - 금·현금성, 환헤지 손익(carry) 항목 추가, 단기/장기 단위 통일
-⑥ 총수익(Total Return) 데이터: 분할 반영 종가 + 분배금 재투자로 직접 산출
-   - 한국 ETF 분배금 CSV 업로드 시 업로드 값을 우선 사용 (yfinance 누락 보완)
-   - 데이터 품질 점검표(분배금 건수·분배수익률·누락 의심 경고) 제공
+⑥ 총수익(Total Return) 데이터: 분할 반영 종가 + yfinance 분배금 재투자로 직접 산출
 (부수 수정) NAV에 기준일(=100)을 포함하여 첫 영업일 수익률이 누락되지 않도록 수정
 """
 
@@ -307,100 +305,15 @@ def fetch_fred_series(series_id: str) -> pd.Series:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ⑥ TOTAL RETURN (분배금 재투자) & 분배금 CSV
+#  ⑥ TOTAL RETURN (분배금 재투자)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DIST_TEMPLATE_CSV = (
-    "종목코드,배당락일,분배금\n"
-    "114260,2025-01-31,000\n"
-    "471230,2025-04-30,000\n"
-)
-
-
-def _normalize_ticker(code: str) -> str:
-    code = str(code).strip().upper()
-    if "." in code:
-        return code
-    digits = "".join(ch for ch in code if ch.isalnum())
-    if digits.isdigit():
-        return digits.zfill(6) + ".KS"
-    return digits
-
-
-def parse_distribution_csv(file) -> tuple[dict[str, pd.Series], str]:
-    """
-    분배금 CSV 파싱.
-    - 종목코드 컬럼: 종목코드 / ticker / code
-    - 날짜 컬럼:   배당락일 / ex_date / date / 날짜  → 해당일(휴장이면 다음 영업일)에 반영
-                  지급기준일 / 기준일 / record_date → 직전 영업일(배당락일)에 반영
-    - 금액 컬럼:   분배금 / 분배금액 / amount / dividend (1좌당 원)
-    반환: ({ticker: Series(date → 금액, 'record' 여부는 attrs)}, 메시지)
-    """
-    try:
-        df = pd.read_csv(file, dtype=str, encoding="utf-8-sig")
-    except Exception:
-        try:
-            file.seek(0)
-            df = pd.read_csv(file, dtype=str, encoding="cp949")
-        except Exception as e:
-            return {}, f"CSV를 읽을 수 없습니다: {e}"
-
-    cols = {c.strip().lower(): c for c in df.columns}
-
-    def pick(cands):
-        for c in cands:
-            if c in cols:
-                return cols[c]
-        return None
-
-    c_tk = pick(["종목코드", "ticker", "code", "종목"])
-    c_ex = pick(["배당락일", "ex_date", "exdate", "date", "날짜"])
-    c_rec = pick(["지급기준일", "기준일", "record_date"])
-    c_amt = pick(["분배금", "분배금액", "amount", "dividend", "dps"])
-    c_dt = c_ex or c_rec
-    if not (c_tk and c_dt and c_amt):
-        return {}, "필수 컬럼(종목코드, 배당락일 또는 지급기준일, 분배금)을 찾지 못했습니다."
-
-    is_record = c_ex is None
-    d = pd.DataFrame({
-        "ticker": df[c_tk].map(_normalize_ticker),
-        "date": pd.to_datetime(df[c_dt], errors="coerce"),
-        "amt": pd.to_numeric(df[c_amt].astype(str).str.replace(",", ""), errors="coerce"),
-    }).dropna()
-    d = d[d["amt"] > 0]
-
-    out: dict[str, pd.Series] = {}
-    for tk, g in d.groupby("ticker"):
-        s = g.groupby("date")["amt"].sum().sort_index()
-        s.attrs["is_record_date"] = is_record
-        out[tk] = s
-    kind = "지급기준일(→직전 영업일 배당락 처리)" if is_record else "배당락일"
-    return out, f"{len(out)}개 종목, {len(d)}건 로드 ({kind} 기준)"
-
-
-def build_total_return(raw: pd.DataFrame, override: pd.Series | None = None) -> tuple[pd.Series, pd.Series]:
-    """
-    총수익 지수 = 100 × Π (P_t + D_t) / P_{t-1}
-    override(분배금 CSV)가 있으면 yfinance 분배금 대신 사용.
-    반환: (TR 지수, 영업일 기준 분배금 Series)
-    """
+def build_total_return(raw: pd.DataFrame) -> pd.Series:
+    """총수익 지수 = 100 × Π (P_t + D_t) / P_{t-1}  (P: 분할 반영 종가, D: yfinance 분배금)"""
     close = raw["close"]
-    if override is not None and len(override) > 0:
-        div = pd.Series(0.0, index=close.index)
-        is_record = bool(override.attrs.get("is_record_date", False))
-        for d, amt in override.items():
-            if is_record:
-                pos = close.index.searchsorted(pd.Timestamp(d), side="left") - 1   # 기준일 직전 영업일
-            else:
-                pos = close.index.searchsorted(pd.Timestamp(d), side="left")       # 당일 또는 다음 영업일
-            if 0 < pos < len(close):
-                div.iloc[pos] += float(amt)
-    else:
-        div = raw["div"].fillna(0.0)
-
+    div = raw["div"].fillna(0.0)
     gross = (close + div) / close.shift(1)
     gross.iloc[0] = 1.0
-    tr = 100.0 * gross.cumprod()
-    return tr.astype("float64"), div
+    return (100.0 * gross.cumprod()).astype("float64")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -708,11 +621,9 @@ def run_backtest(params: dict) -> dict | None:
         st.error("❌ 유효한 포트폴리오 종목이 존재하지 않습니다.")
         return None
 
-    dist_override: dict[str, pd.Series] = params.get("dist_override") or {}
     tr: dict[str, pd.Series] = {}
-    divs: dict[str, pd.Series] = {}
     for t, df in raw.items():
-        tr[t], divs[t] = build_total_return(df, dist_override.get(t))
+        tr[t] = build_total_return(df)
 
     # ── 2. 기준 캘린더 (② 한국 종목이 있으면 한국 영업일) ──
     kr_mkt = [t for t in avail_mkt if is_kr_ticker(t)]
@@ -857,7 +768,7 @@ def run_backtest(params: dict) -> dict | None:
         warm_start = (first_valid - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
         spy_raw = fetch_raw("SPY", warm_start, e_str)
         if not spy_raw.empty:
-            spy_tr, _ = build_total_return(spy_raw)
+            spy_tr = build_total_return(spy_raw)
             spy_rsi = calc_rsi(spy_tr, params["rsi_period"])      # 미국 영업일 그대로 계산
             sig_native = compute_rsi_signal(
                 spy_rsi, params["rsi_entry"], params["rsi_exit"], params["rsi_max_days"]
@@ -969,31 +880,6 @@ def run_backtest(params: dict) -> dict | None:
     attribution["check_gap"] = total_display - sum(v for k, v in attribution.items()
                                                    if k.endswith("_contrib"))
 
-    # ── 13. 데이터 품질 점검표 (⑥) ──
-    span_years = max((idx[-1] - idx[0]).days / 365.25, 1e-9)
-    dq_rows = []
-    for t in avail_mkt:
-        d = divs[t].loc[idx[0]:idx[-1]]
-        c_prev = raw[t]["close"].shift(1).reindex(d.index)
-        n_div = int((d > 0).sum())
-        yld = float((d / c_prev).fillna(0.0).sum()) / span_years * 100
-        src = "분배금 CSV" if t in dist_override else "yfinance"
-        status = "정상"
-        name = ALL_NAMES.get(t, t)
-        if is_kr_ticker(t) and n_div == 0 and span_years >= 1.0 and "TR" not in name:
-            status = "⚠️ 분배금 0건 — TR형이 아니라면 누락 의심, 분배금 CSV 업로드 권장"
-        elif is_kr_ticker(t) and n_div == 0 and span_years < 1.0 and "TR" not in name:
-            status = "ℹ️ 기간 내 분배 없음 (단기 구간이면 정상일 수 있음)"
-        dq_rows.append({
-            "종목": t.replace(".KS", ""), "종목명": name, "데이터 출처": src,
-            "분배금 건수": n_div, "연환산 분배수익률(%)": round(yld, 2), "상태": status,
-        })
-    if "BANK_DEPOSIT" in pt:
-        dq_rows.append({"종목": "BANK_DEPOSIT", "종목명": CASH_OPTS["BANK_DEPOSIT"],
-                        "데이터 출처": "합성 (ACT/365 일할)", "분배금 건수": 0,
-                        "연환산 분배수익률(%)": round(BANK_RATE * 100, 2), "상태": "정상"})
-    data_quality = pd.DataFrame(dq_rows)
-
     return {
         "nav_open":             nav_open,
         "nav_hedged":           nav_hedged,
@@ -1027,7 +913,6 @@ def run_backtest(params: dict) -> dict | None:
         "avg_carry_pa":         avg_carry_pa,
         "hedge_ratio":          params["hedge_ratio"],
         "taa_days_rsi":         taa_days_rsi,
-        "data_quality":         data_quality,
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1213,23 +1098,6 @@ def render_sidebar() -> tuple[dict, bool]:
                 "조회 실패 시 위 수동값을 사용합니다. 수동값은 현재 시장금리로 확인 후 입력하세요."
             )
 
-        # ── 8. 한국 ETF 분배금 데이터 (총수익 보정) ──
-        with st.expander("🧾 한국 ETF 분배금 데이터 (총수익 보정)", expanded=False):
-            st.caption(
-                "yfinance는 한국 ETF 분배금이 누락되는 경우가 있습니다. "
-                "KRX 정보데이터시스템·운용사 공시의 분배금 내역을 CSV로 올리면 해당 종목은 업로드 값으로 총수익을 계산합니다."
-            )
-            dist_file = st.file_uploader("분배금 CSV 업로드", type=["csv"], key="dist_csv")
-            dist_override: dict[str, pd.Series] = {}
-            if dist_file is not None:
-                dist_override, msg = parse_distribution_csv(dist_file)
-                (st.success if dist_override else st.error)(msg)
-            st.download_button(
-                "CSV 양식 받기", data=DIST_TEMPLATE_CSV.encode("utf-8-sig"),
-                file_name="분배금_양식.csv", mime="text/csv", key="dist_tpl",
-            )
-            st.caption("컬럼: 종목코드, 배당락일(또는 지급기준일), 분배금(1좌당 원)")
-
         st.divider()
         run_clicked = st.button("🚀 시뮬레이션 재실행", type="primary", use_container_width=True)
 
@@ -1260,7 +1128,6 @@ def render_sidebar() -> tuple[dict, bool]:
         "hedge_cost_mode":  hedge_cost_mode,
         "manual_kr_rate":   manual_kr_rate,
         "manual_us_rate":   manual_us_rate,
-        "dist_override":    dist_override,
     }
     return params, run_clicked
 
@@ -1502,7 +1369,7 @@ def render_dashboard(res: dict, show_hedged: bool):
     st.divider()
 
     # ────────────────────────────────────────────────────────────────
-    # [5] 자산배분 유효 비중 상세 & 데이터 품질
+    # [5] 자산배분 유효 비중 상세
     # ────────────────────────────────────────────────────────────────
     with st.expander("🔍 포트폴리오 유효 자산배분 비중 상세", expanded=False):
         c_cat, c_asset = st.columns(2)
@@ -1519,14 +1386,6 @@ def render_dashboard(res: dict, show_hedged: bool):
                 [{"종목": k, "비중(%)": round(v * 100, 2)} for k, v in res["weights"].items()]
             ).sort_values("비중(%)", ascending=False).reset_index(drop=True)
             st.dataframe(w_df, hide_index=True, use_container_width=True)
-
-    dq = res.get("data_quality", pd.DataFrame())
-    n_warn = int(dq["상태"].astype(str).str.startswith("⚠️").sum()) if not dq.empty else 0
-    with st.expander(f"🧪 데이터 품질 점검 (총수익·분배금){' — ⚠️ ' + str(n_warn) + '건' if n_warn else ''}",
-                     expanded=n_warn > 0):
-        st.caption("모든 종목은 '분할 반영 종가 + 분배금 재투자'로 총수익을 직접 계산합니다.")
-        if not dq.empty:
-            st.dataframe(dq, hide_index=True, use_container_width=True)
 
     # ────────────────────────────────────────────────────────────────
     # [6] 엑셀 다운로드 (openpyxl 활용)
@@ -1558,8 +1417,6 @@ def render_dashboard(res: dict, show_hedged: bool):
         attr_df.to_excel(w, sheet_name="목표수익률기여도분해", index=False)
         yearly_exp.to_excel(w, sheet_name="연도별수익률", index=False)
         nav_df.to_excel(w, sheet_name="일별NAV", index=False)
-        if not dq.empty:
-            dq.to_excel(w, sheet_name="데이터품질", index=False)
 
     st.download_button(
         label="📥 엑셀 다운로드 (국채_ETF_혼합형펀드_백테스팅_결과.xlsx)",
