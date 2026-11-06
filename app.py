@@ -50,6 +50,7 @@ import plotly.graph_objects as go
 import requests
 from datetime import date, timedelta
 import io
+import json
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -950,6 +951,101 @@ def run_backtest(params: dict) -> dict | None:
     attribution["check_gap"] = total_display - sum(v for k, v in attribution.items()
                                                    if k.endswith("_contrib"))
 
+    # ── 14. 내보내기용 상세 (AI 해설·검증) ──
+    #   종목별 기여도: 위와 같은 linking·스케일 → 종목 합계 + 공모주 = 총수익률
+    asset_rows = []
+    for j, t in enumerate(pt):
+        w_j = weight_matrix[:, j]
+        c_loc = linked(w_j * local_u[:, j]) * scale
+        c_fx = linked(w_j * fx_u[:, j]) * scale
+        c_car = linked(w_j * car_u[:, j]) * scale
+        ret_listing = (float(np.prod(1 + R[:, j])) - 1) * 100
+        ret_krw = (float(np.prod(1 + local_u[:, j] + fx_u[:, j] + car_u[:, j])) - 1) * 100
+        asset_rows.append({
+            "종목코드": t.replace(".KS", ""),
+            "종목명": ALL_NAMES.get(t, t),
+            "자산군": {"bond": "국채", "equity": "지수", "alt": "금·현금성"}.get(group.get(t), "-"),
+            "상장통화": "USD" if t in us_set else "KRW",
+            "평균 비중(%)": round(float(w_j.mean()) * 100, 4),
+            "상장통화 총수익률(%)": round(ret_listing, 4),
+            "원화 환산 수익률(%, 헤지 반영)": round(ret_krw, 4),
+            "현지수익 기여(%p)": round(c_loc, 4),
+            "환차익 기여(%p)": round(c_fx, 4),
+            "헤지손익 기여(%p)": round(c_car, 4),
+            "합계 기여(%p)": round(c_loc + c_fx + c_car, 4),
+        })
+    asset_detail = pd.DataFrame(asset_rows)
+
+    #   월별 수익률 (%): 포트폴리오·벤치마크·종목(상장통화 총수익)·환율
+    daily_tbl = pd.DataFrame({"포트폴리오": port_open, "S&P500(KRW) 벤치마크": bench_open}, index=returns.index)
+    for j, t in enumerate(pt):
+        daily_tbl[t.replace(".KS", "")] = R[:, j]
+    daily_tbl["USD/KRW 변동"] = fx_ret.reindex(returns.index).fillna(0.0)
+    monthly_returns = ((1 + daily_tbl).resample("ME").prod() - 1) * 100
+    if has_fx:
+        monthly_returns["USD/KRW 월말"] = fx_lvl.resample("ME").last().reindex(monthly_returns.index)
+    if not rate_daily.empty:
+        rm = rate_daily.resample("ME").last().reindex(monthly_returns.index)
+        monthly_returns["원화 단기금리 월말(%)"] = rm["원화 단기금리(%)"]
+        monthly_returns["달러 단기금리 월말(%)"] = rm["달러 단기금리(%)"]
+    monthly_returns.index = monthly_returns.index.strftime("%Y-%m")
+    monthly_returns.index.name = "월"
+
+    #   검증 체크포인트: 공개 시세와 대조할 수 있는 시작·종료 종가 (분배 미반영 종가)
+    checkpoints = []
+    for t in avail_mkt:
+        c = raw[t]["close"]
+        c0, c1 = c.loc[:idx[0]], c.loc[:idx[-1]]
+        if c0.empty or c1.empty:
+            continue
+        d_sum = float(raw[t]["div"].loc[(raw[t].index > c0.index[-1]) & (raw[t].index <= c1.index[-1])].sum())
+        checkpoints.append({
+            "종목코드": t.replace(".KS", ""),
+            "종목명": ALL_NAMES.get(t, t),
+            "통화": "USD" if t in us_set else "KRW",
+            "시작 종가 기준일": c0.index[-1].date(),
+            "시작 종가": round(float(c0.iloc[-1]), 4),
+            "종료 종가 기준일": c1.index[-1].date(),
+            "종료 종가": round(float(c1.iloc[-1]), 4),
+            "가격 수익률(%)": round((float(c1.iloc[-1]) / float(c0.iloc[-1]) - 1) * 100, 4),
+            "기간 분배금 합계(1주당)": round(d_sum, 4),
+            "총수익률(%, 분배 재투자)": round((float(prices[t].iloc[-1]) / float(prices[t].iloc[0]) - 1) * 100, 4),
+        })
+    fx_check = None
+    if has_fx:
+        f = fx_df["close"]
+        f0, f1 = f.loc[:idx[0]], f.loc[:idx[-1]]
+        if not f0.empty and not f1.empty:
+            fx_check = {
+                "출처": "Yahoo Finance KRW=X",
+                "시작 기준일": f0.index[-1].date(), "시작 환율": round(float(f0.iloc[-1]), 4),
+                "종료 기준일": f1.index[-1].date(), "종료 환율": round(float(f1.iloc[-1]), 4),
+                "변동률(%)": round((float(f1.iloc[-1]) / float(f0.iloc[-1]) - 1) * 100, 4),
+            }
+
+    params_snapshot = {
+        "요청 시작일": start_req.date(), "요청 종료일": end_ts.date(),
+        "자산군 비중 입력(%)": {
+            "미국 국고채": params["weight_us_bond"], "한국 국고채": params["weight_kr_bond"],
+            "미국 지수 ETF": params["weight_us_eq"], "한국 지수 ETF": params["weight_kr_eq"],
+            "대체·현금성": params["weight_alt_cash"],
+        },
+        "선택 종목": {
+            "미국 국고채": params["us_bonds"], "한국 국고채": params["kr_bonds"],
+            "미국 지수 ETF": params["us_equity"], "한국 지수 ETF": params["kr_equity"],
+            "금(GLDM)": params["gold_enabled"], "현금성": params["cash_ticker"],
+        },
+        "공모주 Alpha 가정(연 %p)": params["ipo_alpha"],
+        "환헤지 비율(%)": params["hedge_ratio"],
+        "헤지 금리 산출": params["hedge_cost_mode"],
+        "수동 금리(원화/달러, %)": [params["manual_kr_rate"], params["manual_us_rate"]],
+        "RSI TAA": ({"사용": True, "기간": params["rsi_period"], "진입": params["rsi_entry"],
+                     "탈출": params["rsi_exit"], "최대 유지일": params["rsi_max_days"]}
+                    if params["rsi_taa_enabled"] else {"사용": False}),
+        "턴어라운드 연도": params["turnaround_years"] if params["turnaround_enabled"] else [],
+        "TAA 적용 영업일 수": int((taa_signal > 0).sum()),
+    }
+
     return {
         "nav_open":             nav_open,
         "nav_hedged":           nav_hedged,
@@ -988,6 +1084,11 @@ def run_backtest(params: dict) -> dict | None:
         "taa_days_rsi":         taa_days_rsi,
         "start_adjustment":     start_adjustment,
         "requested_start":      start_req.date(),
+        "asset_detail":         asset_detail,
+        "monthly_returns":      monthly_returns,
+        "checkpoints":          checkpoints,
+        "fx_check":             fx_check,
+        "params_snapshot":      params_snapshot,
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1310,6 +1411,293 @@ def render_rate_details(res: dict):
         st.dataframe(monthly.round(3).iloc[::-1], use_container_width=True, height=260)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  AI 해설·검증용 데이터 내보내기
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AI_PROMPT = """당신은 자산운용사 리서치 애널리스트입니다. 아래 데이터는 '국채·지수 ETF 혼합형 펀드'의 가상 백테스트 결과입니다.
+다음 세 가지 작업을 순서대로 수행해 주세요.
+
+[작업 1] 값 검증
+ 1) 내부 정합성: (a) '월별 수익률'의 포트폴리오 값을 복리로 연결한 결과가 '핵심 지표'의 누적 수익률과 맞는지,
+    (b) '성과 기여도' 항목 합계가 합산 실현치와 같은지, (c) '종목별 상세'의 합계 기여 + 공모주 Alpha가 총수익률과 같은지 확인하세요.
+    (표시 자릿수 반올림 때문에 0.01%p 이내 차이는 일치로 판단하세요.)
+ 2) 외부 대조: '검증 체크포인트'의 종목별 시작·종료 종가, USD/KRW 환율, '헤지 금리'의 원화·달러 금리를
+    공개 자료(거래소·운용사 공시, 한국은행 ECOS, FRED, 미 재무부 등)와 대조하세요.
+    차이가 있으면 원인(분배금 재투자 여부, 미국 종가와 한국 영업일의 날짜 시차, 데이터 소스 차이 등)을 추정하세요.
+ 3) 상식 점검: 기간 중 미국·한국 국채 금리 변화 방향과 채권 ETF 수익률(듀레이션 감안)이 맞는지,
+    지수 ETF 수익률이 해당 지수 흐름과 맞는지, 환차익 기여가 USD/KRW 변동과 맞는지 대략 추정해 보세요.
+
+[작업 2] 해설
+ - 수익 원천별(국채 / 지수 / 환차익 / 환헤지 손익 / 금·현금성 / 공모주 Alpha)로 왜 이런 값이 나왔는지,
+   기간 중 시황과 경제 이슈(연준·한국은행 통화정책, 국채 금리, 환율, 주식시장 주요 이벤트)를 근거로 설명하세요.
+ - '연도별 수익률'과 '주요 낙폭 구간'의 원인을 날짜와 연결해 설명하세요.
+ - 목표 수익률 8% 대비 달성 여부와 그 이유를 정리하세요.
+
+[작업 3] 한계와 시사점
+ - '가정 및 한계'에 적힌 가정이 결과에 미쳤을 영향(특히 공모주 Alpha는 입력 가정치이며 실제 성과가 아님)을 평가하세요.
+ - 이 결과가 앞으로도 재현될 수 있는 조건과 리스크를 정리하세요.
+
+[규칙]
+ - 확인된 사실과 추정을 구분해 표시하세요. 외부 자료를 인용할 때는 출처와 기준일을 밝히세요.
+ - 확인할 수 없는 시황이나 수치는 지어내지 말고 '확인 필요'로 남기세요. 데이터에 없는 값을 만들지 마세요.
+
+[출력 형식]
+ 1) 검증 결과 요약표 (항목 / 결과: 일치·불일치·확인 불가 / 근거)
+ 2) 수익 원천별 해설
+ 3) 연도별·낙폭 구간 해설
+ 4) 리스크와 시사점
+"""
+
+EXPORT_ASSUMPTIONS = [
+    "가상 백테스트이며 실제 운용 성과가 아님. 거래비용·세금·운용보수 외 비용은 반영하지 않음 (ETF 총보수는 가격에 반영됨).",
+    "비중은 매 영업일 목표 비중으로 리밸런싱한다고 가정 (TAA 적용일은 주식 비중 30%로 확대).",
+    "총수익 = Yahoo Finance 분할 반영 종가 + 분배금 재투자. Yahoo 데이터에 분배금이 누락된 종목은 총수익이 과소 계산될 수 있음.",
+    "한국 종목이 있으면 한국 영업일 기준 캘린더를 사용하고, 미국 종목은 직전 미국 종가를 사용 (날짜 시차 존재).",
+    "환율은 Yahoo Finance KRW=X 사용. 미국 상장 자산의 원화 수익률 = (1+현지수익률)(1+환율변동) − 1 − 헤지비율×(환율변동 − 금리차).",
+    "헤지 손익(금리차)은 전 영업일의 (원화 단기금리 − 달러 단기금리) × 경과일/365로 근사. 원화 금리는 FRED 월평균 자료.",
+    "국내상장 환노출 ETF(360750, 133690, 379800)는 원화 가격에서 환율 효과를 분리해 지수 기여와 환차익 기여로 나눔.",
+    "공모주 Alpha는 사용자가 입력한 연간 가정치를 달력일 기준으로 일할 가산한 값 (실제 공모주 성과 아님).",
+    "은대(BANK_DEPOSIT)는 연 2.53% 고정 금리를 달력일 기준(ACT/365)으로 일할한 합성 자산.",
+    "샤프 지수의 무위험수익률은 연 3% 고정.",
+    "조회 시작일은 선택 종목 중 가장 늦게 상장한 종목의 데이터 첫 거래일(또는 USD/KRW 데이터 시작일)로 자동 보정됨.",
+]
+
+
+def top_drawdowns(nav: pd.Series, n: int = 3) -> pd.DataFrame:
+    """겹치지 않는 낙폭 구간 상위 n개 (고점일·저점일·회복일·낙폭)."""
+    dd = nav / nav.cummax() - 1
+    covered = pd.Series(False, index=nav.index)
+    rows = []
+    for _ in range(n):
+        cand = dd[~covered]
+        if cand.empty or cand.min() >= -1e-9:
+            break
+        trough = cand.idxmin()
+        before = dd.loc[:trough]
+        peak = before[before >= -1e-12].index[-1]
+        after = dd.loc[trough:]
+        rec = after[after >= -1e-12]
+        recovery = rec.index[0] if len(rec) else None
+        covered.loc[peak:(recovery or nav.index[-1])] = True
+        rows.append({
+            "순위": len(rows) + 1,
+            "고점일": peak.date(), "저점일": trough.date(),
+            "회복일": recovery.date() if recovery is not None else "미회복",
+            "낙폭(%)": round(float(dd.loc[trough]) * 100, 4),
+            "하락 기간(일)": (trough - peak).days,
+            "회복 기간(일)": (recovery - trough).days if recovery is not None else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def _jsonable(o):
+    """JSON 직렬화: 날짜→문자열, NaN→null, numpy→파이썬 기본형."""
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, pd.DataFrame):
+        return [_jsonable(r) for r in o.to_dict("records")]
+    if isinstance(o, pd.Series):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (pd.Timestamp, date)):
+        return o.strftime("%Y-%m-%d")
+    if isinstance(o, (np.bool_, bool)):
+        return bool(o)
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating, float)):
+        return None if not np.isfinite(o) else round(float(o), 6)
+    return o
+
+
+def build_ai_export(res: dict) -> dict:
+    """AI 해설·검증에 넘길 구조화 데이터."""
+    is_short = res["is_short_term"]
+    attr = res["attribution"]
+    nav_b = res["nav_benchmark"]
+    bench_ret = nav_b.pct_change().dropna()
+    ppy = res.get("periods_per_year", 252.0)
+    unit = "기간 누적(%p)" if is_short else "연환산 CAGR 기준(%p)"
+
+    yearly = pd.DataFrame({
+        "연도": res["yearly_portfolio"].index,
+        "포트폴리오(%)": res["yearly_portfolio"].values,
+        "S&P500(KRW)(%)": res["yearly_benchmark"].reindex(res["yearly_portfolio"].index).values,
+        "환헤지 100%(%)": res["yearly_hedged"].reindex(res["yearly_portfolio"].index).values,
+    })
+    adj = res.get("start_adjustment")
+    start_is_listing = bool(adj) and abs((res["analysis_start"] - pd.Timestamp(adj["new_start"])).days) <= PARTIAL_YEAR_GRACE_DAYS
+    labels, notes = yearly_labels(yearly["연도"], res["analysis_start"], res["analysis_end"], start_is_listing)
+    yearly["표기"], yearly["비고"] = labels, notes
+
+    monthly = res["monthly_returns"].reset_index()
+
+    asset_sum = float(res["asset_detail"]["합계 기여(%p)"].sum()) if not res["asset_detail"].empty else 0.0
+    payload = {
+        "개요": {
+            "생성 시각": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "내용": "국채·지수 ETF 혼합형 펀드 가상 백테스트 결과",
+            "통화 기준": "KRW",
+            "분석 구간": {
+                "시작": res["analysis_start"], "종료": res["analysis_end"],
+                "달력일": res["total_days"], "영업일 수": res["trading_days"],
+                "기준 캘린더": res.get("calendar_label"),
+            },
+            "단기 모드(1년 미만)": is_short,
+            "조회 시작일 보정": adj,
+        },
+        "설정": res.get("params_snapshot", {}),
+        "실효 비중(%)": {k: v * 100 for k, v in res["weights"].items()},
+        "핵심 지표": {
+            "포트폴리오": {
+                "누적 수익률(%)": res["cumulative_return"],
+                ("연환산 수익률(%)" if is_short else "CAGR(%)"): res["cagr"],
+                "목표 8% 대비(%p)": None if is_short else res["cagr"] - 8.0,
+                "연환산 변동성(%)": res["volatility"],
+                "샤프 지수(Rf 3%)": res["sharpe"],
+                "최대 낙폭 MDD(%)": res["mdd"],
+                "환헤지 100% 가정 CAGR(%)": res["cagr_hedged"],
+            },
+            "벤치마크 S&P500(KRW)": {
+                "누적 수익률(%)": res["benchmark_cumulative"],
+                ("연환산 수익률(%)" if is_short else "CAGR(%)"): calc_returns_and_cagr(nav_b)[1],
+                "연환산 변동성(%)": calc_volatility(bench_ret, ppy),
+                "샤프 지수(Rf 3%)": calc_sharpe(bench_ret, res.get("dt_days"), ppy),
+                "최대 낙폭 MDD(%)": calc_mdd(nav_b),
+            },
+        },
+        "성과 기여도": {
+            "단위": unit,
+            "① 국채 ETF": attr["bond_contrib"], "② 지수 ETF": attr["eq_contrib"],
+            "③ 환차익": attr["fx_contrib"], "④ 공모주 Alpha(가정치)": attr["ipo_contrib"],
+            "⑤ 금·현금성": attr["alt_contrib"], "⑥ 환헤지 손익(금리차)": attr["carry_contrib"],
+            "합산 실현치": attr["total_cagr"],
+            "합계 검증 오차": attr["check_gap"],
+            "설계 목표 모델": {"① 국채 ETF": "3~4%p", "② 지수 ETF": "0~3%p", "③ 환차익": "3~5%p",
+                           "④ 공모주 Alpha": "0~1%p", "합산": "8~10%"},
+        },
+        "종목별 상세": {
+            "단위": unit,
+            "설명": "합계 기여 = 현지수익 + 환차익 + 헤지손익. 종목 합계 + 공모주 Alpha = 합산 실현치 (반올림 오차 0.01%p 이내). "
+                  "TAA 적용일에는 주식 비중이 커지므로, 그 기간 주식 수익이 기여도에 더 크게 반영됨.",
+            "종목 합계 기여(%p)": asset_sum,
+            "표": res["asset_detail"],
+        },
+        "연도별 수익률": yearly,
+        "주요 낙폭 구간": top_drawdowns(res["nav_open"]),
+        "월별 수익률(%)": {
+            "설명": "포트폴리오·벤치마크는 원화 기준. 종목 열은 상장통화 기준 총수익률(분배 재투자). "
+                  "USD/KRW 변동은 월간 환율 변동률, 월말 열은 수준값.",
+            "표": monthly,
+        },
+        "헤지 금리": {
+            "출처 요약": res.get("rate_note"),
+            "기간 평균 금리차(%p)": res.get("avg_carry_pa"),
+            "요약": rate_summary_df(res),
+        },
+        "검증 체크포인트": {
+            "설명": "공개 시세와 대조용. 종가는 분배 미반영(분할만 반영). 미국 종목의 기준일은 한국 영업일 기준 직전 미국 거래일일 수 있음.",
+            "종목 종가": res.get("checkpoints", []),
+            "USD/KRW": res.get("fx_check"),
+        },
+        "가정 및 한계": EXPORT_ASSUMPTIONS,
+    }
+    return _jsonable(payload)
+
+
+def _md_cell(v) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:,.4f}".rstrip("0").rstrip(".") if abs(v) < 1e6 else f"{v:,.0f}"
+    return str(v).replace("|", "/").replace("\n", " ")
+
+
+def _md_table(rows: list[dict]) -> str:
+    if not rows:
+        return "(데이터 없음)\n"
+    cols = list(rows[0].keys())
+    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    for r in rows:
+        out.append("| " + " | ".join(_md_cell(r.get(c)) for c in cols) + " |")
+    return "\n".join(out) + "\n"
+
+
+def _md_kv(d: dict, indent: str = "") -> str:
+    lines = []
+    for k, v in d.items():
+        if isinstance(v, dict):
+            lines.append(f"{indent}- **{k}**")
+            lines.append(_md_kv(v, indent + "  "))
+        else:
+            lines.append(f"{indent}- {k}: {_md_cell(v) if not isinstance(v, list) else ', '.join(map(str, v)) or '-'}")
+    return "\n".join(lines)
+
+
+def render_ai_markdown(payload: dict, include_prompt: bool = True) -> str:
+    """AI 채팅에 그대로 붙여 넣을 수 있는 Markdown 문서."""
+    p = payload
+    parts = []
+    if include_prompt:
+        parts += ["# 요청", "", AI_PROMPT, "", "---", ""]
+    parts += ["# 백테스트 결과 데이터", ""]
+    parts += ["## 개요", _md_kv(p["개요"]), ""]
+    parts += ["## 설정", _md_kv(p["설정"]), ""]
+    parts += ["## 실효 비중(%)", _md_kv(p["실효 비중(%)"]), ""]
+    parts += ["## 핵심 지표", _md_kv(p["핵심 지표"]), ""]
+    parts += ["## 성과 기여도", _md_kv(p["성과 기여도"]), ""]
+    sd = p["종목별 상세"]
+    parts += ["## 종목별 상세", f"단위: {sd['단위']} · {sd['설명']} · 종목 합계 기여 {_md_cell(sd['종목 합계 기여(%p)'])}%p", "",
+              _md_table(sd["표"])]
+    parts += ["## 연도별 수익률", _md_table(p["연도별 수익률"])]
+    parts += ["## 주요 낙폭 구간", _md_table(p["주요 낙폭 구간"])]
+    hg = p["헤지 금리"]
+    parts += ["## 헤지 금리", f"출처: {hg['출처 요약']} · 기간 평균 금리차 {_md_cell(hg['기간 평균 금리차(%p)'])}%p", "",
+              _md_table(hg["요약"])]
+    cp = p["검증 체크포인트"]
+    parts += ["## 검증 체크포인트", cp["설명"], "", _md_table(cp["종목 종가"])]
+    if cp["USD/KRW"]:
+        parts += ["USD/KRW: " + ", ".join(f"{k} {_md_cell(v)}" for k, v in cp["USD/KRW"].items()), ""]
+    mr = p["월별 수익률(%)"]
+    parts += ["## 월별 수익률(%)", mr["설명"], "", _md_table(mr["표"])]
+    parts += ["## 가정 및 한계"] + [f"- {a}" for a in p["가정 및 한계"]] + [""]
+    return "\n".join(parts)
+
+
+def render_ai_export_section(res: dict):
+    """대시보드 하단: AI 해설·검증용 내보내기."""
+    st.subheader("🤖 AI 해설·검증용 데이터 내보내기")
+    st.caption(
+        "분석 결과를 AI에게 넘겨 **값 검증**과 **시황 기반 해설**을 받을 수 있도록 구조화한 데이터입니다. "
+        "Markdown 파일에는 AI 요청 프롬프트가 맨 앞에 들어 있어, 파일 내용을 그대로 붙여 넣거나 첨부하면 됩니다."
+    )
+    payload = build_ai_export(res)
+    md_text = render_ai_markdown(payload, include_prompt=True)
+    json_text = json.dumps({"AI 요청 프롬프트": AI_PROMPT, **payload}, ensure_ascii=False, indent=2)
+    stamp = f"{res['analysis_start']:%Y%m%d}_{res['analysis_end']:%Y%m%d}"
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "📝 AI용 리포트 (Markdown, 프롬프트 포함)", data=md_text.encode("utf-8"),
+            file_name=f"백테스트_AI분석용_{stamp}.md", mime="text/markdown",
+            use_container_width=True, key="dl_ai_md",
+        )
+    with c2:
+        st.download_button(
+            "🧾 AI용 데이터 (JSON)", data=json_text.encode("utf-8"),
+            file_name=f"백테스트_AI분석용_{stamp}.json", mime="application/json",
+            use_container_width=True, key="dl_ai_json",
+        )
+    st.caption(f"포함 내용: 설정 · 핵심 지표 · 성과 기여도 · 종목별 기여도 · 연도별/월별 수익률 · 주요 낙폭 구간 · "
+               f"헤지 금리 · 검증 체크포인트(종가·환율) · 가정 및 한계  |  Markdown 약 {len(md_text):,}자")
+
+    with st.expander("📋 AI 요청 프롬프트 (복사용)", expanded=False):
+        st.code(AI_PROMPT, language=None)
+    with st.expander("👀 내보낼 데이터 미리보기 (Markdown)", expanded=False):
+        st.code(render_ai_markdown(payload, include_prompt=False), language="markdown")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN DASHBOARD DISPLAY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def render_dashboard(res: dict, show_hedged: bool):
@@ -1603,6 +1991,12 @@ def render_dashboard(res: dict, show_hedged: bool):
         attr_df.to_excel(w, sheet_name="목표수익률기여도분해", index=False)
         yearly_exp.to_excel(w, sheet_name="연도별수익률", index=False)
         nav_df.to_excel(w, sheet_name="일별NAV", index=False)
+        if not res["asset_detail"].empty:
+            res["asset_detail"].to_excel(w, sheet_name="종목별기여도", index=False)
+        res["monthly_returns"].round(4).reset_index().to_excel(w, sheet_name="월별수익률", index=False)
+        top_drawdowns(res["nav_open"]).to_excel(w, sheet_name="주요낙폭구간", index=False)
+        if res.get("checkpoints"):
+            pd.DataFrame(res["checkpoints"]).to_excel(w, sheet_name="검증체크포인트", index=False)
         rate_sum = rate_summary_df(res)
         if not rate_sum.empty:
             rate_sum.to_excel(w, sheet_name="헤지금리요약", index=False)
@@ -1617,6 +2011,12 @@ def render_dashboard(res: dict, show_hedged: bool):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+    # ────────────────────────────────────────────────────────────────
+    # [7] AI 해설·검증용 데이터 내보내기
+    # ────────────────────────────────────────────────────────────────
+    st.divider()
+    render_ai_export_section(res)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN ENTRY POINT
