@@ -1057,7 +1057,7 @@ def run_backtest(params: dict) -> dict | None:
         asset_rows.append({
             "종목코드": t.replace(".KS", ""),
             "종목명": ALL_NAMES.get(t, t),
-            "자산군": {"bond": "국채", "equity": "지수", "alt": "금·현금성"}.get(group.get(t), "-"),
+            "자산군": CLASS_LABEL[ticker_class(params, t)],
             "상장통화": "USD" if t in us_set else "KRW",
             "환헤지 비율(%)": None if hedge_ratio_for(params, t) is None else round(hedge_ratio_for(params, t) * 100, 1),
             "평균 비중(%)": round(float(w_j.mean()) * 100, 4),
@@ -1069,6 +1069,65 @@ def run_backtest(params: dict) -> dict | None:
             "합계 기여(%p)": round(c_loc + c_fx + c_car, 4),
         })
     asset_detail = pd.DataFrame(asset_rows)
+    if not asset_detail.empty:
+        cls_order = {CLASS_LABEL[k]: i for i, k in enumerate(["us_bond", "kr_bond", "us_eq", "kr_eq", "alt"])}
+        asset_detail = (asset_detail.assign(_o=asset_detail["자산군"].map(cls_order))
+                        .sort_values(["_o", "평균 비중(%)"], ascending=[True, False])
+                        .drop(columns="_o").reset_index(drop=True))
+
+    #   종목별 RAW 데이터 (백테스트에 실제로 쓰인 일별 값, 분석 캘린더 기준)
+    ret_krw_all = local_u + fx_u + car_u
+    pad = lambda arr: np.r_[np.nan, arr]                     # 기준일 행은 수익률 없음
+    raw_sheets: dict[str, pd.DataFrame] = {}
+    for j, t in enumerate(pt):
+        d = pd.DataFrame(index=idx)
+        d.index.name = "분석일"
+        if t in raw:
+            src = raw[t]
+            pos = src.index.searchsorted(idx, side="right") - 1   # 각 분석일에 쓰인 원자료 행 (as-of)
+            d["원자료 기준일"] = src.index[pos].date
+            d["종가(분할 반영, 원자료)"] = src["close"].to_numpy()[pos]
+            cumdiv = src["div"].cumsum().to_numpy()[pos]
+            d["분배금(직전 행 이후 합계, 1주당)"] = np.r_[np.nan, np.diff(cumdiv)]
+        else:
+            d["원자료 기준일"] = idx.date
+            d["합성 NAV(은대)"] = prices[t].to_numpy()
+        d["총수익지수(분배 재투자, 시작=100)"] = (prices[t] / prices[t].iloc[0] * 100).to_numpy()
+        d["일간 총수익률(상장통화, %)"] = pad(R[:, j] * 100)
+        if (is_us[j] or is_krfx[j]) and has_fx:
+            d["USD/KRW"] = fx_lvl.to_numpy()
+            d["환율 변동(%)"] = pad(fx_col[:, 0] * 100)
+        h_j = hedge_ratio_for(params, t)
+        if h_j is not None:
+            d["환헤지 비율(%)"] = h_j * 100
+        d["현지수익(%)"] = pad(local_u[:, j] * 100)
+        d["환효과(%)"] = pad(fx_u[:, j] * 100)
+        d["헤지손익(%)"] = pad(car_u[:, j] * 100)
+        d["원화 환산 수익률(%)"] = pad(ret_krw_all[:, j] * 100)
+        d["적용 비중(%)"] = pad(weight_matrix[:, j] * 100)
+        d["포트폴리오 기여(당일, %p)"] = pad(weight_matrix[:, j] * ret_krw_all[:, j] * 100)
+        raw_sheets[t] = d
+
+    port_sheet = pd.DataFrame(index=idx)
+    port_sheet.index.name = "분석일"
+    port_sheet["NAV 펀드(시작=100)"] = nav_open.to_numpy()
+    port_sheet["일간 수익률(%)"] = pad(port_open_arr * 100)
+    port_sheet["종목 기여 합계(%p)"] = pad((weight_matrix * ret_krw_all).sum(axis=1) * 100)
+    port_sheet["공모주 Alpha(%p)"] = pad(alpha_arr * 100)
+    port_sheet["TAA 적용(1=적용)"] = pad(taa_mask.astype(float))
+    port_sheet["NAV 환헤지100%(시작=100)"] = nav_hedged.to_numpy()
+    port_sheet["NAV S&P500 KRW 벤치마크(시작=100)"] = nav_bench.to_numpy()
+
+    fx_sheet = pd.DataFrame(index=idx)
+    fx_sheet.index.name = "분석일"
+    if has_fx:
+        fpos = fx_df.index.searchsorted(idx, side="right") - 1
+        fx_sheet["USD/KRW 원자료 기준일"] = [fx_df.index[p].date() if p >= 0 else None for p in fpos]
+        fx_sheet["USD/KRW"] = fx_lvl.to_numpy()
+        fx_sheet["환율 변동(%)"] = pad(fx_col[:, 0] * 100)
+    if not rate_daily.empty:
+        fx_sheet = fx_sheet.join(rate_daily)
+        fx_sheet["헤지 carry(당일, %)"] = pad(car_col[:, 0] * 100)
 
     #   월별 수익률 (%): 포트폴리오·벤치마크·종목(상장통화 총수익)·환율
     daily_tbl = pd.DataFrame({"포트폴리오": port_open, "S&P500(KRW) 벤치마크": bench_open}, index=returns.index)
@@ -1194,6 +1253,10 @@ def run_backtest(params: dict) -> dict | None:
         "checkpoints":          checkpoints,
         "fx_check":             fx_check,
         "params_snapshot":      params_snapshot,
+        "raw_sheets":           raw_sheets,
+        "raw_portfolio":        port_sheet,
+        "raw_fx_rates":         fx_sheet,
+        "run_id":               f"{pd.Timestamp.now().value}",
     }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1916,6 +1979,182 @@ def render_ai_export_section(res: dict):
         st.code(render_ai_markdown(payload, include_prompt=False), language="markdown")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  자산군 내 종목별 수익 기여도 (화면)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONTRIB_COLS = ["현지수익 기여(%p)", "환차익 기여(%p)", "헤지손익 기여(%p)", "합계 기여(%p)"]
+
+
+def contribution_by_class_table(ad: pd.DataFrame) -> pd.DataFrame:
+    """자산군별로 묶은 종목 기여도 표 (자산군 소계 행 포함)."""
+    rows = []
+    for cls, g in ad.groupby("자산군", sort=False):
+        cls_total = float(g["합계 기여(%p)"].sum())
+        for _, r in g.iterrows():
+            rows.append({
+                "자산군": cls, "종목": r["종목코드"], "종목명": r["종목명"],
+                "평균 비중(%)": r["평균 비중(%)"],
+                "상장통화 총수익률(%)": r["상장통화 총수익률(%)"],
+                **{c: r[c] for c in CONTRIB_COLS},
+                "자산군 내 기여 비중(%)": (r["합계 기여(%p)"] / cls_total * 100) if abs(cls_total) > 1e-12 else None,
+            })
+        rows.append({
+            "자산군": cls, "종목": "▶ 소계", "종목명": f"{cls} 합계",
+            "평균 비중(%)": float(g["평균 비중(%)"].sum()),
+            "상장통화 총수익률(%)": None,
+            **{c: float(g[c].sum()) for c in CONTRIB_COLS},
+            "자산군 내 기여 비중(%)": 100.0 if abs(cls_total) > 1e-12 else None,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_asset_contribution(res: dict, unit_txt: str):
+    ad = res.get("asset_detail")
+    if ad is None or ad.empty:
+        return
+    attr = res["attribution"]
+    st.subheader("🧩 자산군 내 종목별 수익 기여도")
+    st.caption(
+        f"단위: **{unit_txt}**. 각 종목의 기여 = 현지수익(가격·이자·배당) + 환차익 + 헤지손익. "
+        f"종목 합계 {ad['합계 기여(%p)'].sum():+.2f}%p + 공모주 Alpha {attr['ipo_contrib']:+.2f}%p "
+        f"= 합산 실현치 {attr['total_cagr']:.2f}%"
+    )
+
+    # 자산군 소계 카드
+    cls_sum = ad.groupby("자산군", sort=False)["합계 기여(%p)"].sum()
+    cols = st.columns(len(cls_sum))
+    for col, (cls, v) in zip(cols, cls_sum.items()):
+        n = int((ad["자산군"] == cls).sum())
+        col.metric(cls, f"{v:+.2f}%p", delta=f"{n}개 종목", delta_color="off")
+
+    # 종목별 누적 막대 (현지수익 / 환차익 / 헤지손익)
+    labels = [f"{r['자산군']} · {r['종목코드']}" for _, r in ad.iterrows()]
+    fig = go.Figure()
+    for col_name, name, color in [("현지수익 기여(%p)", "현지수익", "#1976D2"),
+                                  ("환차익 기여(%p)", "환차익", "#F57C00"),
+                                  ("헤지손익 기여(%p)", "헤지손익", "#00838F")]:
+        fig.add_trace(go.Bar(y=labels, x=ad[col_name], name=name, orientation="h", marker_color=color))
+    fig.add_trace(go.Scatter(
+        y=labels, x=ad["합계 기여(%p)"], mode="markers+text", name="합계",
+        marker=dict(color="#212121", size=9, symbol="diamond"),
+        text=[f"{v:+.2f}" for v in ad["합계 기여(%p)"]], textposition="middle right",
+    ))
+    fig.update_layout(
+        barmode="relative", template="plotly_white", height=max(260, 46 * len(ad) + 80),
+        xaxis_title="기여도 (%p)", yaxis=dict(autorange="reversed"),
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        margin=dict(l=10, r=40, t=30, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    tbl = contribution_by_class_table(ad)
+    num_cols = ["평균 비중(%)", "상장통화 총수익률(%)", *CONTRIB_COLS, "자산군 내 기여 비중(%)"]
+    st.dataframe(
+        tbl.style.format({c: "{:+.2f}" if "기여(%p)" in c else "{:.2f}" for c in num_cols}, na_rep="-")
+           .apply(lambda r: ["font-weight: bold; background-color: #f1f3f5" if r["종목"] == "▶ 소계" else "" for _ in r], axis=1),
+        hide_index=True, use_container_width=True,
+    )
+    st.caption(
+        "· 자산군 소계의 **현지수익** 합은 위 ①국채·②지수·⑤금·현금성 기여도와, **환차익** 합은 ③, **헤지손익** 합은 ⑥과 같습니다.  \n"
+        "· 상장통화 총수익률은 종목 자체의 기간 수익률(분배 재투자)이고, 기여도는 비중과 시점을 반영한 값입니다. "
+        "TAA로 비중이 바뀐 기간이 있으면 두 값의 크기가 다르게 보일 수 있습니다.  \n"
+        "· 자산군 내 기여 비중은 종목 기여 ÷ 자산군 소계입니다. 한 자산군 안에 플러스·마이너스 종목이 섞이면 "
+        "100%를 넘거나 음수가 될 수 있습니다."
+    )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  종목별 RAW 데이터 엑셀
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAW_COLUMN_GUIDE = [
+    ("분석일", "백테스트 캘린더의 날짜 (한국 종목이 있으면 한국 영업일)"),
+    ("원자료 기준일", "그 분석일에 실제로 쓰인 Yahoo Finance 원자료의 날짜. 미국 종목은 한국 영업일 기준 직전 미국 거래일일 수 있음"),
+    ("종가(분할 반영, 원자료)", "Yahoo Finance 종가 (분할만 반영, 분배 미반영)"),
+    ("분배금(직전 행 이후 합계, 1주당)", "직전 분석일의 원자료 기준일 다음 날 ~ 이번 원자료 기준일 사이의 분배금 합계"),
+    ("합성 NAV(은대)", "은대 연 2.53%를 달력일(ACT/365)로 일할한 합성 가격"),
+    ("총수익지수", "분배금을 재투자한 총수익 지수 (분석 시작일 = 100)"),
+    ("일간 총수익률(상장통화, %)", "총수익지수의 전일 대비 변동률 (달러 자산은 달러 기준)"),
+    ("USD/KRW · 환율 변동(%)", "Yahoo Finance KRW=X, 분석일 기준 as-of 값과 전일 대비 변동률"),
+    ("환헤지 비율(%)", "해당 종목에 적용한 환헤지 비율 (미국 국고채 / 미국 지수 ETF 각각 설정, 금은 환오픈)"),
+    ("현지수익 · 환효과 · 헤지손익(%)", "원화 환산 수익률을 세 요소로 분해한 값 (세 값의 합 = 원화 환산 수익률)"),
+    ("원화 환산 수익률(%)", "원화 투자자 기준 당일 수익률 (헤지 반영)"),
+    ("적용 비중(%)", "그날 수익률에 적용한 포트폴리오 비중 (TAA 적용일에는 조정된 비중)"),
+    ("포트폴리오 기여(당일, %p)", "적용 비중 × 원화 환산 수익률. 모든 종목 합계 + 공모주 Alpha = 포트폴리오 일간 수익률"),
+]
+
+
+def _sheet_name(name: str, used: set) -> str:
+    bad = '[]:*?/\\'
+    base = "".join("_" if ch in bad else ch for ch in name)[:31]
+    out, i = base, 2
+    while out in used:
+        suffix = f"_{i}"
+        out = base[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(out)
+    return out
+
+
+def build_raw_excel(res: dict) -> bytes:
+    """종목별 RAW 데이터 엑셀 (종목마다 시트 1개 + 포트폴리오 + 환율·금리 + 설명)."""
+    from openpyxl.utils import get_column_letter
+
+    buf = io.BytesIO()
+    used: set = set()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        info = pd.DataFrame(
+            [("분석 구간", f"{res['analysis_start']:%Y-%m-%d} ~ {res['analysis_end']:%Y-%m-%d} "
+                         f"({res['trading_days']}영업일, {res.get('calendar_label', '-')})"),
+             ("환헤지", f"{res.get('hedge_label', '-')} (포트폴리오 기준 {res.get('hedged_share', 0):.1f}%)"),
+             ("헤지 금리 출처", res.get("rate_note", "-")),
+             ("데이터 출처", "시세·분배금·환율: Yahoo Finance (yfinance) / 금리: ^IRX, FRED"),
+             ("", ""), ("[열 설명]", "")] + RAW_COLUMN_GUIDE,
+            columns=["항목", "설명"],
+        )
+        info.to_excel(w, sheet_name=_sheet_name("설명", used), index=False)
+        res["weight_table"].to_excel(w, sheet_name=_sheet_name("종목별비중", used), index=False)
+        res["asset_detail"].to_excel(w, sheet_name=_sheet_name("종목별기여도", used), index=False)
+        res["raw_portfolio"].reset_index().to_excel(w, sheet_name=_sheet_name("포트폴리오", used), index=False)
+        if not res["raw_fx_rates"].empty and len(res["raw_fx_rates"].columns):
+            res["raw_fx_rates"].reset_index().to_excel(w, sheet_name=_sheet_name("환율·금리", used), index=False)
+        for t, df in res["raw_sheets"].items():
+            out = df.reset_index()
+            out["분석일"] = pd.to_datetime(out["분석일"]).dt.date
+            out.to_excel(w, sheet_name=_sheet_name(t.replace(".KS", "").replace(".KQ", ""), used), index=False)
+
+        for ws in w.book.worksheets:
+            ws.freeze_panes = "B2"
+            for i, col in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
+                header = str(col[0].value or "")
+                width = 60 if ws.title == "설명" and i == 2 else max(11, min(32, len(header) * 1.6 + 2))
+                ws.column_dimensions[get_column_letter(i)].width = width
+    return buf.getvalue()
+
+
+def render_raw_download(res: dict):
+    """RAW 엑셀은 크기가 커서 버튼을 눌렀을 때만 만들고, 같은 결과에 대해서는 다시 쓰지 않음."""
+    run_id = res.get("run_id", "")
+    ss = st.session_state
+    n_t = len(res.get("raw_sheets", {}))
+    n_rows = len(res.get("raw_portfolio", []))
+    st.markdown("##### 📦 종목별 RAW 데이터")
+    st.caption(f"종목 {n_t}개 × {n_rows:,}일. 종목마다 시트 1개 (원자료 기준일·종가·분배금·총수익지수·환율·헤지비율·"
+               f"원화 수익률 분해·적용 비중·당일 기여) + 포트폴리오 · 환율·금리 · 열 설명 시트")
+    if ss.get("_raw_xlsx_id") != run_id:
+        if st.button("📦 RAW 데이터 엑셀 만들기", use_container_width=True, key="btn_make_raw"):
+            with st.spinner("RAW 데이터 엑셀 생성 중..."):
+                ss["_raw_xlsx"] = build_raw_excel(res)
+                ss["_raw_xlsx_id"] = run_id
+    if ss.get("_raw_xlsx_id") == run_id:
+        stamp = f"{res['analysis_start']:%Y%m%d}_{res['analysis_end']:%Y%m%d}"
+        st.download_button(
+            "📥 종목별 RAW 데이터 다운로드 (.xlsx)", data=ss["_raw_xlsx"],
+            file_name=f"종목별_RAW데이터_{stamp}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key="dl_raw_xlsx",
+        )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN DASHBOARD DISPLAY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def render_dashboard(res: dict, show_hedged: bool):
@@ -2061,6 +2300,9 @@ def render_dashboard(res: dict, show_hedged: bool):
     )
     st.plotly_chart(fig_attr, use_container_width=True)
     render_rate_details(res)
+
+    st.divider()
+    render_asset_contribution(res, unit_txt)
 
     st.divider()
 
@@ -2233,6 +2475,7 @@ def render_dashboard(res: dict, show_hedged: bool):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    render_raw_download(res)
 
     # ────────────────────────────────────────────────────────────────
     # [7] AI 해설·검증용 데이터 내보내기
