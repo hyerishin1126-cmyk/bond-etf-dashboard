@@ -593,73 +593,130 @@ def align_signal_no_lookahead(sig_native: pd.Series, price_index: pd.DatetimeInd
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  WEIGHT ALLOCATION LOGIC
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _calc_weights(params: dict, available: list[str]) -> tuple[dict[str, float], dict[str, float]]:
-    w_us_bond = params["weight_us_bond"] / 100.0
-    w_kr_bond = params["weight_kr_bond"] / 100.0
-    w_us_eq   = params["weight_us_eq"] / 100.0
-    w_kr_eq   = params["weight_kr_eq"] / 100.0
-    w_alt     = params["weight_alt_cash"] / 100.0
+# 자산군 정의: (키, params 종목 목록 키, 표시명, 비중 슬라이더 키)
+ASSET_CLASSES = [
+    ("us_bond", "us_bonds",  "미국 국고채",   "weight_us_bond"),
+    ("kr_bond", "kr_bonds",  "한국 국고채",   "weight_kr_bond"),
+    ("us_eq",   "us_equity", "미국 지수 ETF", "weight_us_eq"),
+    ("kr_eq",   "kr_equity", "한국 지수 ETF", "weight_kr_eq"),
+]
+CLASS_LABEL = {k: lbl for k, _, lbl, _ in ASSET_CLASSES} | {"alt": "대체·현금성"}
 
-    sum_raw = w_us_bond + w_kr_bond + w_us_eq + w_kr_eq + w_alt
+
+def ticker_class(params: dict, t: str) -> str:
+    """종목이 속한 자산군 키 (us_bond / kr_bond / us_eq / kr_eq / alt)."""
+    for k, lst, _, _ in ASSET_CLASSES:
+        if t in params.get(lst, []):
+            return k
+    return "alt"
+
+
+def class_split(params: dict, cls: str, tickers: list[str]) -> dict[str, float]:
+    """
+    자산군 내 종목별 비중 (합계 1.0). 0% 종목은 제외.
+    params["splits"][cls] = {ticker: 입력 비중(%)} — 없으면 균등 배분.
+    """
+    raw = (params.get("splits") or {}).get(cls) or {}
+    vals = {t: float(raw.get(t, 0.0)) if raw else 1.0 for t in tickers}
+    vals = {t: v for t, v in vals.items() if v > 0}
+    tot = sum(vals.values())
+    return {t: v / tot for t, v in vals.items()} if tot > 0 else {}
+
+
+def hedge_ratio_for(params: dict, t: str) -> float | None:
+    """종목별 환헤지 비율(0~1). 미국 국고채·미국 지수 ETF만 헤지, 금(GLDM)은 환오픈, 원화 자산은 None."""
+    legacy = params.get("hedge_ratio", 0)          # 구버전 단일 헤지 비율 호환
+    if t in params.get("us_bonds", []):
+        return params.get("hedge_us_bond", legacy) / 100.0
+    if t in params.get("us_equity", []):
+        return params.get("hedge_us_eq", legacy) / 100.0
+    if t == "GLDM":
+        return 0.0
+    return None
+
+
+def _calc_weights(params: dict, available: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    포트폴리오 종목별 비중.
+    ① 자산군 비중(슬라이더)을 합계 100%로 정규화
+    ② 자산군 안에서는 종목별 입력 비중(splits)으로 나눔 (입력 없으면 균등)
+    ③ 미국 국고채가 비어 있으면 그 비중은 한국 국고채로 이전
+    반환: (종목별 비중, 자산군별 실제 비중) — 자산군 비중은 최종 종목 비중을 다시 합산한 값
+    """
+    raw_w = {k: params[wk] / 100.0 for k, _, _, wk in ASSET_CLASSES}
+    raw_w["alt"] = params["weight_alt_cash"] / 100.0
+    sum_raw = sum(raw_w.values())
     if sum_raw <= 0:
         return {}, {}
-
-    scale = 1.0 / sum_raw
-    c_us_bond = w_us_bond * scale
-    c_kr_bond = w_kr_bond * scale
-    c_us_eq   = w_us_eq * scale
-    c_kr_eq   = w_kr_eq * scale
-    c_alt     = w_alt * scale
+    c = {k: v / sum_raw for k, v in raw_w.items()}
 
     weights: dict[str, float] = {}
 
-    us_bd_list = [t for t in params["us_bonds"] if t in available]
-    if us_bd_list and c_us_bond > 0:
-        for t in us_bd_list:
-            weights[t] = c_us_bond / len(us_bd_list)
-    else:
-        c_kr_bond += c_us_bond
+    def put(cls: str, list_key: str) -> bool:
+        lst = [t for t in params[list_key] if t in available]
+        sp = class_split(params, cls, lst)
+        for t, share in sp.items():
+            weights[t] = weights.get(t, 0.0) + c[cls] * share
+        return bool(sp)
 
-    kr_bd_list = [t for t in params["kr_bonds"] if t in available]
-    if kr_bd_list and c_kr_bond > 0:
-        for t in kr_bd_list:
-            weights[t] = weights.get(t, 0.0) + (c_kr_bond / len(kr_bd_list))
-
-    us_eq_list = [t for t in params["us_equity"] if t in available]
-    if us_eq_list and c_us_eq > 0:
-        for t in us_eq_list:
-            weights[t] = c_us_eq / len(us_eq_list)
-
-    kr_eq_list = [t for t in params["kr_equity"] if t in available]
-    if kr_eq_list and c_kr_eq > 0:
-        for t in kr_eq_list:
-            weights[t] = c_kr_eq / len(kr_eq_list)
+    if not (c["us_bond"] > 0 and put("us_bond", "us_bonds")):
+        c["kr_bond"] += c["us_bond"]          # 미국채 미선택 → 한국 국고채로 이전
+        c["us_bond"] = 0.0
+    if c["kr_bond"] > 0:
+        put("kr_bond", "kr_bonds")
+    if c["us_eq"] > 0:
+        put("us_eq", "us_equity")
+    if c["kr_eq"] > 0:
+        put("kr_eq", "kr_equity")
 
     gold_on = params["gold_enabled"] and "GLDM" in available
     cash_tk = params["cash_ticker"]
     cash_ok = cash_tk and cash_tk in available
-
-    if c_alt > 0:
+    if c["alt"] > 0:
         if gold_on and cash_ok:
-            weights["GLDM"] = c_alt * 0.5
-            weights[cash_tk] = c_alt * 0.5
+            weights["GLDM"] = c["alt"] * 0.5
+            weights[cash_tk] = c["alt"] * 0.5
         elif gold_on:
-            weights["GLDM"] = c_alt
+            weights["GLDM"] = c["alt"]
         elif cash_ok:
-            weights[cash_tk] = c_alt
+            weights[cash_tk] = c["alt"]
 
     tot = sum(weights.values())
     if tot > 0:
         weights = {k: v / tot for k, v in weights.items()}
 
-    category_summary = {
-        "미국 국고채": c_us_bond,
-        "한국 국고채": c_kr_bond,
-        "미국 지수 ETF": c_us_eq,
-        "한국 지수 ETF": c_kr_eq,
-        "대체·현금성": c_alt,
-    }
+    category_summary = {CLASS_LABEL[k]: 0.0 for k in ["us_bond", "kr_bond", "us_eq", "kr_eq", "alt"]}
+    for t, w in weights.items():
+        category_summary[CLASS_LABEL[ticker_class(params, t)]] += w
     return weights, category_summary
+
+
+def weight_table(params: dict, weights: dict[str, float], with_hedge: bool = True) -> pd.DataFrame:
+    """자산군·종목별 비중 표 (자산군 내 비중, 포트폴리오 비중, 환헤지 비율)."""
+    order = {k: i for i, k in enumerate(["us_bond", "kr_bond", "us_eq", "kr_eq", "alt"])}
+    cls_tot: dict[str, float] = {}
+    for t, w in weights.items():
+        k = ticker_class(params, t)
+        cls_tot[k] = cls_tot.get(k, 0.0) + w
+    rows = []
+    for t, w in weights.items():
+        k = ticker_class(params, t)
+        row = {
+            "자산군": CLASS_LABEL[k],
+            "종목": t.replace(".KS", ""),
+            "종목명": ALL_NAMES.get(t, t),
+            "자산군 내 비중(%)": round(w / cls_tot[k] * 100, 2) if cls_tot[k] > 0 else 0.0,
+            "포트폴리오 비중(%)": round(w * 100, 2),
+            "_o": (order[k], -w),
+        }
+        if with_hedge:
+            h = hedge_ratio_for(params, t)
+            row["환헤지(%)"] = "-" if h is None else ("환오픈" if t == "GLDM" else f"{h * 100:.0f}%")
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("_o").drop(columns="_o").reset_index(drop=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  BACKTEST ENGINE & ATTRIBUTION BREAKDOWN
@@ -670,29 +727,15 @@ def run_backtest(params: dict) -> dict | None:
     e_str = end_ts.strftime("%Y-%m-%d")
     floor_str = DATA_FLOOR.strftime("%Y-%m-%d")     # 상장일 파악을 위해 항상 전체 이력 조회 (종목별 캐시)
 
-    # ── 0. 편입 후보 (비중 0% 자산군은 공통 구간을 줄이지 않도록 제외) ──
-    w_raw = {
-        "us_bond": params["weight_us_bond"], "kr_bond": params["weight_kr_bond"],
-        "us_eq": params["weight_us_eq"], "kr_eq": params["weight_kr_eq"],
-        "alt": params["weight_alt_cash"],
-    }
-    if not params["us_bonds"]:
-        w_raw["kr_bond"] += w_raw["us_bond"]       # _calc_weights의 미국채→한국채 이전 규칙과 동일
-
-    group: dict[str, str] = {}      # ticker → 기여도 버킷 (bond / equity / alt)
-    for t in params["us_bonds"]:
-        if w_raw["us_bond"] > 0: group[t] = "bond"
-    for t in params["kr_bonds"]:
-        if w_raw["kr_bond"] > 0: group[t] = "bond"
-    for t in params["us_equity"]:
-        if w_raw["us_eq"] > 0: group[t] = "equity"
-    for t in params["kr_equity"]:
-        if w_raw["kr_eq"] > 0: group[t] = "equity"
-    if w_raw["alt"] > 0:
-        if params["gold_enabled"]:
-            group["GLDM"] = "alt"
-        if params["cash_ticker"]:
-            group[params["cash_ticker"]] = "alt"
+    # ── 0. 편입 후보: 비중이 0보다 큰 종목만 (비중 0% 종목·자산군은 공통 구간을 줄이지 않도록 제외) ──
+    candidates = list(dict.fromkeys(
+        params["us_bonds"] + params["kr_bonds"] + params["us_equity"] + params["kr_equity"]
+        + (["GLDM"] if params["gold_enabled"] else [])
+        + ([params["cash_ticker"]] if params["cash_ticker"] else [])
+    ))
+    pre_w, _ = _calc_weights(params, candidates)
+    bucket = {"us_bond": "bond", "kr_bond": "bond", "us_eq": "equity", "kr_eq": "equity", "alt": "alt"}
+    group: dict[str, str] = {t: bucket[ticker_class(params, t)] for t, w in pre_w.items() if w > 0}
     if not group:
         st.error("❌ 비중이 0%보다 큰 자산군에서 최소 하나의 종목을 선택하세요.")
         return None
@@ -852,9 +895,12 @@ def run_backtest(params: dict) -> dict | None:
     is_us = np.array([t in us_set for t in pt])
     is_krfx = np.array([t in KR_LISTED_US_FX for t in pt])
 
-    def decompose(h: float):
+    # 종목별 환헤지 비율: 미국 국고채 / 미국 지수 ETF 각각 설정, 금(GLDM)은 환오픈
+    h_user_vec = np.array([hedge_ratio_for(params, t) or 0.0 for t in pt], dtype="float64")
+
+    def decompose(h_vec: np.ndarray):
         """
-        원화 수익률 = 현지수익률 + 환효과 + 헤지carry
+        원화 수익률 = 현지수익률 + 환효과 + 헤지carry   (h_vec: 종목별 헤지 비율)
         - 미국 상장(헤지비율 h): (1+r)(1+fx) − 1 − h·(fx − carry)
               → 현지 r / 환효과 (1−h)·fx + r·fx / carry h·carry
         - 국내상장 환노출 ETF: 현지 = (1+r)/(1+fx) − 1, 환효과 = r − 현지
@@ -864,8 +910,9 @@ def run_backtest(params: dict) -> dict | None:
         cp = np.zeros_like(R)
         if is_us.any():
             r_us = R[:, is_us]
-            fxp[:, is_us] = (1 - h) * fx_col + r_us * fx_col
-            cp[:, is_us] = h * car_col
+            h_us = h_vec[is_us][None, :]
+            fxp[:, is_us] = (1 - h_us) * fx_col + r_us * fx_col
+            cp[:, is_us] = h_us * car_col
         if is_krfx.any():
             r_kf = R[:, is_krfx]
             loc = (1 + r_kf) / (1 + fx_col) - 1
@@ -927,11 +974,10 @@ def run_backtest(params: dict) -> dict | None:
     dt_arr = dt.reindex(returns.index).to_numpy(dtype="float64")
     alpha_arr = (1 + params["ipo_alpha"] / 100.0) ** (dt_arr / DAY_COUNT) - 1
 
-    h_user = params["hedge_ratio"] / 100.0
-    local_u, fx_u, car_u = decompose(h_user)
+    local_u, fx_u, car_u = decompose(h_user_vec)
     port_open_arr = (weight_matrix * (local_u + fx_u + car_u)).sum(axis=1) + alpha_arr
 
-    local_h, fx_h, car_h = decompose(1.0)
+    local_h, fx_h, car_h = decompose(np.ones(len(pt)))
     port_hedged_arr = (weight_matrix * (local_h + fx_h + car_h)).sum(axis=1) + alpha_arr
 
     port_open = pd.Series(port_open_arr, index=returns.index, dtype="float64")
@@ -1013,6 +1059,7 @@ def run_backtest(params: dict) -> dict | None:
             "종목명": ALL_NAMES.get(t, t),
             "자산군": {"bond": "국채", "equity": "지수", "alt": "금·현금성"}.get(group.get(t), "-"),
             "상장통화": "USD" if t in us_set else "KRW",
+            "환헤지 비율(%)": None if hedge_ratio_for(params, t) is None else round(hedge_ratio_for(params, t) * 100, 1),
             "평균 비중(%)": round(float(w_j.mean()) * 100, 4),
             "상장통화 총수익률(%)": round(ret_listing, 4),
             "원화 환산 수익률(%, 헤지 반영)": round(ret_krw, 4),
@@ -1070,6 +1117,11 @@ def run_backtest(params: dict) -> dict | None:
                 "변동률(%)": round((float(f1.iloc[-1]) / float(f0.iloc[-1]) - 1) * 100, 4),
             }
 
+    hb_pct = params.get("hedge_us_bond", params.get("hedge_ratio", 0))
+    he_pct = params.get("hedge_us_eq", params.get("hedge_ratio", 0))
+    hedge_label = f"미국채 {hb_pct}% · 미국주식 {he_pct}%"
+    hedged_share = float(sum(weights.get(t, 0.0) * (hedge_ratio_for(params, t) or 0.0) for t in pt)) * 100
+
     params_snapshot = {
         "요청 시작일": start_req.date(), "요청 종료일": end_ts.date(),
         "자산군 비중 입력(%)": {
@@ -1083,7 +1135,9 @@ def run_backtest(params: dict) -> dict | None:
             "금(GLDM)": params["gold_enabled"], "현금성": params["cash_ticker"],
         },
         "공모주 Alpha 가정(연 %p)": params["ipo_alpha"],
-        "환헤지 비율(%)": params["hedge_ratio"],
+        "자산군 내 종목 비중 입력(%)": params.get("splits", {}),
+        "환헤지 비율(%)": {"미국 국고채": hb_pct, "미국 지수 ETF": he_pct, "금(GLDM)": "환오픈"},
+        "포트폴리오 기준 실효 헤지 비중(%)": round(hedged_share, 4),
         "헤지 금리 산출": params["hedge_cost_mode"],
         "수동 금리(원화/달러, %)": [params["manual_kr_rate"], params["manual_us_rate"]],
         "RSI TAA": ({"사용": True, "기간": params["rsi_period"], "진입": params["rsi_entry"],
@@ -1127,7 +1181,11 @@ def run_backtest(params: dict) -> dict | None:
         "rate_info":            rate_info,
         "rate_daily":           rate_daily,
         "hedge_cost_mode":      params["hedge_cost_mode"],
-        "hedge_ratio":          params["hedge_ratio"],
+        "hedge_us_bond":        hb_pct,
+        "hedge_us_eq":          he_pct,
+        "hedge_label":          hedge_label,
+        "hedged_share":         hedged_share,
+        "weight_table":         weight_table(params, weights),
         "taa_days_rsi":         taa_days_rsi,
         "start_adjustment":     start_adjustment,
         "requested_start":      start_req.date(),
@@ -1141,6 +1199,51 @@ def run_backtest(params: dict) -> dict | None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SIDEBAR UI (파라미터 제어)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def render_split_inputs(cls: str, tickers: list[str], class_w: float) -> dict[str, float]:
+    """
+    자산군 안의 종목별 비중 입력 (종목이 2개 이상일 때만 표시).
+    반환: {ticker: 입력 비중(%)} — 합계가 100이 아니면 계산 시 100%로 정규화.
+    """
+    if len(tickers) <= 1:
+        return {t: 100.0 for t in tickers}
+    ss = st.session_state
+    base_eq = round(100.0 / len(tickers), 1)
+    # 균등 배분 (합계가 정확히 100이 되도록 마지막 종목에 나머지)
+    equal = {t: base_eq for t in tickers}
+    equal[tickers[-1]] = round(100.0 - base_eq * (len(tickers) - 1), 1)
+    sel_key = f"split_sel_{cls}"
+    # 종목 구성이 바뀌면 균등 배분으로 다시 시작
+    if ss.get(sel_key) != tuple(tickers):
+        for t in tickers:
+            ss[f"split_{cls}_{t}"] = equal[t]
+        ss[sel_key] = tuple(tickers)
+
+    def _reset_equal():
+        for t in tickers:
+            st.session_state[f"split_{cls}_{t}"] = equal[t]
+
+    st.caption(f"↳ **{CLASS_LABEL[cls]} 종목별 비중** (자산군 {class_w}% 안에서 나눔)")
+    vals: dict[str, float] = {}
+    for t in tickers:
+        code = t.replace(".KS", "")
+        vals[t] = float(st.number_input(
+            f"{code} · {ALL_NAMES.get(t, t).split(' (')[0]} (자산군 내 %)",
+            min_value=0.0, max_value=100.0, step=5.0, format="%.1f", key=f"split_{cls}_{t}",
+        ))
+    tot = sum(vals.values())
+    parts = " · ".join(
+        f"{t.replace('.KS', '')} {class_w * v / tot:.1f}%" for t, v in vals.items()
+    ) if tot > 0 else "-"
+    if tot <= 0:
+        st.warning(f"⚠️ {CLASS_LABEL[cls]} 종목 비중이 모두 0%입니다. 이 자산군은 편입되지 않습니다.")
+    elif abs(tot - 100) > 0.05:
+        st.caption(f"합계 {tot:.1f}% → 100%로 정규화 | 포트폴리오 기준: {parts}")
+    else:
+        st.caption(f"포트폴리오 기준: {parts}")
+    st.button("균등 배분으로 초기화", key=f"split_eq_{cls}", on_click=_reset_equal)
+    return vals
+
+
 def render_sidebar() -> tuple[dict, bool]:
     with st.sidebar:
         # 로그인 세션 정보 & 로그아웃
@@ -1274,22 +1377,54 @@ def render_sidebar() -> tuple[dict, bool]:
                 ),
             )
 
-        # ── 4. 투자비중 슬라이더 ──
+        # ── 4. 투자비중 슬라이더 (자산군 비중 + 자산군 내 종목별 비중) ──
         with st.expander("⚖️ 자산배분 비중 설정 (목표 8% 포트폴리오)", expanded=True):
             st.caption("💡 **설계 원칙**: 국채 90% 수준 + 지수 ETF 10% 수준")
+            st.caption("한 자산군에 종목을 2개 이상 고르면 아래에 종목별 비중 입력칸이 나타납니다.")
 
             weight_us_bond = st.slider("미국 국고채 비중 (%)", 0, 100, 45, 5)
+            split_us_bond = render_split_inputs("us_bond", us_bonds, weight_us_bond)
             weight_kr_bond = st.slider("한국 국고채 비중 (%)", 0, 100, 45, 5)
+            split_kr_bond = render_split_inputs("kr_bond", kr_bonds, weight_kr_bond)
             weight_us_eq = st.slider("미국 지수 ETF 비중 (%)", 0, 30, 10, 1)
+            split_us_eq = render_split_inputs("us_eq", us_equity, weight_us_eq)
             weight_kr_eq = st.slider("한국 지수 ETF 비중 (%)", 0, 30, 0, 1)
+            split_kr_eq = render_split_inputs("kr_eq", kr_equity, weight_kr_eq)
             weight_alt_cash = st.slider("대체(Gold)/현금성 자산 비중 (%)", 0, 20, 0, 1)
+            splits = {"us_bond": split_us_bond, "kr_bond": split_kr_bond,
+                      "us_eq": split_us_eq, "kr_eq": split_kr_eq}
 
             total_raw_w = weight_us_bond + weight_kr_bond + weight_us_eq + weight_kr_eq + weight_alt_cash
             if total_raw_w == 100:
                 st.success(f"합계 비중: **{total_raw_w}%** (정상)")
             else:
                 st.info(f"합계: **{total_raw_w}%** → 포트폴리오 편입 시 **100% 자동 정규화** 적용")
-            st.caption("비중 0%인 자산군의 종목은 공통 구간 계산에서 제외됩니다.")
+
+            # 위에서 조절한 비중대로 최종 편입 비중 미리보기
+            preview_params = {
+                "us_bonds": us_bonds, "kr_bonds": kr_bonds, "us_equity": us_equity, "kr_equity": kr_equity,
+                "gold_enabled": gold_on, "cash_ticker": cash_ticker, "splits": splits,
+                "weight_us_bond": weight_us_bond, "weight_kr_bond": weight_kr_bond,
+                "weight_us_eq": weight_us_eq, "weight_kr_eq": weight_kr_eq, "weight_alt_cash": weight_alt_cash,
+            }
+            preview_cands = list(dict.fromkeys(
+                us_bonds + kr_bonds + us_equity + kr_equity
+                + (["GLDM"] if gold_on else []) + ([cash_ticker] if cash_ticker else [])
+            ))
+            preview_w, preview_cat = _calc_weights(preview_params, preview_cands)
+            if preview_w:
+                st.markdown("**📋 최종 편입 비중 (포트폴리오 기준)**")
+                cat_line = " · ".join(f"{k} {v * 100:.1f}%" for k, v in preview_cat.items() if v > 0)
+                st.caption(cat_line)
+                st.dataframe(
+                    weight_table(preview_params, preview_w, with_hedge=False)
+                    .drop(columns=["종목명"]),
+                    hide_index=True, use_container_width=True,
+                )
+                if weight_us_bond > 0 and not us_bonds:
+                    st.caption("ℹ️ 미국 국고채 종목이 없어 그 비중은 한국 국고채로 옮겨 계산합니다.")
+            st.caption("비중 0%인 자산군·종목은 공통 구간 계산에서 제외됩니다. "
+                       "데이터가 없는 종목이 빠지면 실제 비중은 결과 화면에서 확인하세요.")
 
         # ── 5. 공모주 수익 기여도(Alpha) ──
         with st.expander("💰 공모주 수익 기여도 (Alpha)", expanded=False):
@@ -1321,10 +1456,31 @@ def render_sidebar() -> tuple[dict, bool]:
         # ── 7. 환율 및 통화 비교 제어 ──
         with st.expander("💱 환율 및 통화 비교 제어", expanded=True):
             st.caption("기본값: **환오픈 (USD 노출)** - 연평균 3% 이상 원화 약세/달러 강세 기대 반영")
-            hedge_ratio = st.slider(
-                "환헤지 비중 (%)", 0, 100, 0, 5,
-                help="0% = 100% 환오픈 (기본값), 100% = 완전 환헤지"
+            st.caption("헤지 비율은 **각 자산군 편입분에 대한 비율**입니다. "
+                       "(예: 미국 국고채 50% 편입 + 헤지 30% → 포트폴리오의 15%를 헤지)")
+            hedge_us_bond = st.slider(
+                "🇺🇸 미국 국고채 환헤지 (%)", 0, 100, 0, 5, key="hedge_us_bond",
+                help="미국 국고채 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
             )
+            hedge_us_eq = st.slider(
+                "🇺🇸 미국 지수 ETF 환헤지 (%)", 0, 100, 0, 5, key="hedge_us_eq",
+                help="미국 지수 ETF 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
+            )
+            if preview_w:
+                cls_w = {k: sum(w for t, w in preview_w.items() if ticker_class(preview_params, t) == k)
+                         for k in ("us_bond", "us_eq")}
+                hedged_b = cls_w["us_bond"] * hedge_us_bond
+                hedged_e = cls_w["us_eq"] * hedge_us_eq
+                gold_w = preview_w.get("GLDM", 0.0) * 100
+                usd_total = cls_w["us_bond"] * 100 + cls_w["us_eq"] * 100 + gold_w
+                st.caption(
+                    f"미국 국고채 {cls_w['us_bond'] * 100:.1f}% × {hedge_us_bond}% = **{hedged_b:.1f}%** 헤지  \n"
+                    f"미국 지수 ETF {cls_w['us_eq'] * 100:.1f}% × {hedge_us_eq}% = **{hedged_e:.1f}%** 헤지  \n"
+                    + (f"금(GLDM) {gold_w:.1f}% = 환오픈  \n" if gold_w > 0 else "")
+                    + f"→ 달러 자산 {usd_total:.1f}% 중 헤지 {hedged_b + hedged_e:.1f}%, "
+                      f"환노출 {usd_total - hedged_b - hedged_e:.1f}% (포트폴리오 기준)"
+                )
+            st.caption("국내상장 환노출 ETF(TIGER 미국S&P500 등)는 원화 상품이라 이 헤지 대상이 아닙니다.")
             show_hedged = st.checkbox("환헤지(USD) 수익률 비교 라인 표시", value=True)
 
             st.markdown("**헤지 비용(금리차) 산출**")
@@ -1369,7 +1525,9 @@ def render_sidebar() -> tuple[dict, bool]:
         "rsi_max_days":     rsi_max,
         "turnaround_enabled": ta_on,
         "turnaround_years": ta_years,
-        "hedge_ratio":      hedge_ratio,
+        "hedge_us_bond":    hedge_us_bond,
+        "hedge_us_eq":      hedge_us_eq,
+        "splits":           splits,
         "show_hedged_line": show_hedged,
         "hedge_cost_mode":  hedge_cost_mode,
         "manual_kr_rate":   manual_kr_rate,
@@ -1511,7 +1669,7 @@ EXPORT_ASSUMPTIONS = [
     "비중은 매 영업일 목표 비중으로 리밸런싱한다고 가정 (TAA 적용일은 주식 비중 30%로 확대).",
     "총수익 = Yahoo Finance 분할 반영 종가 + 분배금 재투자. Yahoo 데이터에 분배금이 누락된 종목은 총수익이 과소 계산될 수 있음.",
     "한국 종목이 있으면 한국 영업일 기준 캘린더를 사용하고, 미국 종목은 직전 미국 종가를 사용 (날짜 시차 존재).",
-    "환율은 Yahoo Finance KRW=X 사용. 미국 상장 자산의 원화 수익률 = (1+현지수익률)(1+환율변동) − 1 − 헤지비율×(환율변동 − 금리차).",
+    "환율은 Yahoo Finance KRW=X 사용. 미국 상장 자산의 원화 수익률 = (1+현지수익률)(1+환율변동) − 1 − 헤지비율×(환율변동 − 금리차). 헤지비율은 미국 국고채·미국 지수 ETF에 각각 따로 적용하고, 금(GLDM)은 환오픈.",
     "헤지 손익(금리차)은 전 영업일의 (원화 단기금리 − 달러 단기금리) × 경과일/365로 근사. 원화 금리는 FRED 월평균 자료.",
     "국내상장 환노출 ETF(360750, 133690, 379800)는 원화 가격에서 환율 효과를 분리해 지수 기여와 환차익 기여로 나눔.",
     "공모주 Alpha는 사용자가 입력한 연간 가정치를 달력일 기준으로 일할 가산한 값 (실제 공모주 성과 아님).",
@@ -1607,6 +1765,7 @@ def build_ai_export(res: dict) -> dict:
         },
         "설정": res.get("params_snapshot", {}),
         "실효 비중(%)": {k: v * 100 for k, v in res["weights"].items()},
+        "종목별 비중 상세": res["weight_table"],
         "핵심 지표": {
             "포트폴리오": {
                 "누적 수익률(%)": res["cumulative_return"],
@@ -1702,7 +1861,7 @@ def render_ai_markdown(payload: dict, include_prompt: bool = True) -> str:
     parts += ["# 백테스트 결과 데이터", ""]
     parts += ["## 개요", _md_kv(p["개요"]), ""]
     parts += ["## 설정", _md_kv(p["설정"]), ""]
-    parts += ["## 실효 비중(%)", _md_kv(p["실효 비중(%)"]), ""]
+    parts += ["## 종목별 비중", _md_table(p["종목별 비중 상세"])]
     parts += ["## 핵심 지표", _md_kv(p["핵심 지표"]), ""]
     parts += ["## 성과 기여도", _md_kv(p["성과 기여도"]), ""]
     sd = p["종목별 상세"]
@@ -1873,7 +2032,8 @@ def render_dashboard(res: dict, show_hedged: bool):
     with b2:
         st.metric(
             "⑥ 환헤지 손익 (금리차)", f"{attr['carry_contrib']:+.2f}%p",
-            help=f"헤지비율 {res.get('hedge_ratio', 0)}% × (원화 − 달러 단기금리). "
+            help=f"헤지 비율 {res.get('hedge_label', '-')} (포트폴리오 기준 {res.get('hedged_share', 0):.1f}% 헤지) "
+                 f"× (원화 − 달러 단기금리). "
                  f"기간 평균 금리차 {res.get('avg_carry_pa', 0):+.2f}%p/년",
         )
     with b3:
@@ -1911,7 +2071,7 @@ def render_dashboard(res: dict, show_hedged: bool):
     fig_nav = go.Figure()
     fig_nav.add_trace(go.Scatter(
         x=res["nav_open"].index, y=res["nav_open"].values,
-        name=f"혼합형 펀드 (환헤지 {res.get('hedge_ratio', 0)}%)",
+        name=f"혼합형 펀드 (헤지 {res.get('hedge_label', '-')})",
         line=dict(color="#1565C0", width=2.5),
     ))
     if show_hedged:
@@ -2004,7 +2164,11 @@ def render_dashboard(res: dict, show_hedged: bool):
     # [5] 자산배분 유효 비중 상세
     # ────────────────────────────────────────────────────────────────
     with st.expander("🔍 포트폴리오 유효 자산배분 비중 상세", expanded=False):
-        c_cat, c_asset = st.columns(2)
+        st.caption(
+            f"실제 계산에 쓰인 비중입니다 (데이터가 없어 빠진 종목은 제외 후 재정규화). "
+            f"환헤지: {res.get('hedge_label', '-')} → 포트폴리오 기준 {res.get('hedged_share', 0):.1f}% 헤지"
+        )
+        c_cat, c_asset = st.columns([1, 2])
         with c_cat:
             st.markdown("##### 📌 자산군별 실효 비중")
             cat_df = pd.DataFrame([
@@ -2014,10 +2178,7 @@ def render_dashboard(res: dict, show_hedged: bool):
 
         with c_asset:
             st.markdown("##### 📌 개별 종목별 실효 비중")
-            w_df = pd.DataFrame(
-                [{"종목": k, "비중(%)": round(v * 100, 2)} for k, v in res["weights"].items()]
-            ).sort_values("비중(%)", ascending=False).reset_index(drop=True)
-            st.dataframe(w_df, hide_index=True, use_container_width=True)
+            st.dataframe(res["weight_table"], hide_index=True, use_container_width=True)
 
     # ────────────────────────────────────────────────────────────────
     # [6] 엑셀 다운로드 (openpyxl 활용)
@@ -2050,6 +2211,8 @@ def render_dashboard(res: dict, show_hedged: bool):
         attr_df.to_excel(w, sheet_name="목표수익률기여도분해", index=False)
         yearly_exp.to_excel(w, sheet_name="연도별수익률", index=False)
         nav_df.to_excel(w, sheet_name="일별NAV", index=False)
+        if not res["weight_table"].empty:
+            res["weight_table"].to_excel(w, sheet_name="종목별비중", index=False)
         if not res["asset_detail"].empty:
             res["asset_detail"].to_excel(w, sheet_name="종목별기여도", index=False)
         res["monthly_returns"].round(4).reset_index().to_excel(w, sheet_name="월별수익률", index=False)
