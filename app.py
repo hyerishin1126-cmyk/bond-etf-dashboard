@@ -128,36 +128,47 @@ KR_BOND = {
     "439870.KS": "KODEX 국고채30년액티브",
 }
 
-# 공식 상장일 (조회 시작일 보정·팝업 안내에 사용).
+# 공식 상장일 (종목명 옆 표시, 조회 시작일 보정·팝업 안내에 사용).
+# 2026-11-12 검증: 한국 종목은 거래소 '상장일' 기준(설정일 아님), 미국 종목은 운용사 Inception Date.
 # 여기에 없는 종목은 시세 데이터의 첫 거래일을 상장일로 간주한다.
 LISTING_DATES: dict[str, date] = {
-    "114260.KS": date(2009, 7, 28),    # KODEX 국고채3년
-    "148070.KS": date(2011, 10, 20),   # KOSEF 국고채10년
-    "439870.KS": date(2022, 8, 23),    # KODEX 국고채30년액티브
+    # 미국 국채 ETF
+    "SGOV":      date(2020, 5, 26),    # iShares 0-3 Month Treasury Bond ETF
+    "0046A0.KS": date(2025, 4, 29),    # TIGER 미국초단기(3개월이하)국채
+    "329750.KS": date(2019, 7, 24),    # TIGER 미국달러단기채권액티브
+    "SHY":       date(2002, 7, 22),    # iShares 1-3 Year Treasury Bond ETF
+    "IEI":       date(2007, 1, 5),     # iShares 3-7 Year Treasury Bond ETF
+    "IEF":       date(2002, 7, 22),    # iShares 7-10 Year Treasury Bond ETF
+    "0085P0.KS": date(2025, 7, 22),    # ACE 미국10년국채액티브
+    "0091C0.KS": date(2025, 8, 19),    # KODEX 미국10년국채액티브(H)
+    "TLT":       date(2002, 7, 22),    # iShares 20+ Year Treasury Bond ETF
+    "476760.KS": date(2024, 3, 12),    # ACE 미국30년국채액티브
+    "453850.KS": date(2023, 3, 14),    # ACE 미국30년국채액티브(H)
+    "484790.KS": date(2024, 6, 18),    # KODEX 미국30년국채액티브(H)
+    # 한국 국고채 ETF
+    "114260.KS": date(2009, 7, 29),    # KODEX 국고채3년
     "471230.KS": date(2023, 11, 14),   # KODEX 국고채10년액티브
-    # 미국 국고채 ETF (Inception Date)
-    "SHY":  date(2002, 7, 22),         # iShares 1-3 Year Treasury Bond ETF
-    "IEF":  date(2002, 7, 22),         # iShares 7-10 Year Treasury Bond ETF
-    "TLT":  date(2002, 7, 22),         # iShares 20+ Year Treasury Bond ETF
-    "IEI":  date(2007, 1, 5),          # iShares 3-7 Year Treasury Bond ETF
-    "GOVT": date(2012, 2, 14),         # iShares U.S. Treasury Bond ETF
-    "SGOV": date(2020, 5, 26),         # iShares 0-3 Month Treasury Bond ETF
-    # 미국 지수 ETF (현지 기준 상장일)
-    "SPY":  date(1993, 1, 22),         # SPDR S&P 500 ETF Trust
-    "DIA":  date(1998, 1, 20),         # SPDR Dow Jones Industrial Average ETF Trust
-    "QQQ":  date(1999, 3, 10),         # Invesco QQQ Trust
-    "IVV":  date(2000, 5, 15),         # iShares Core S&P 500 ETF
-    "VOO":  date(2010, 9, 7),          # Vanguard S&P 500 ETF
-    "QQQM": date(2020, 10, 13),        # Invesco NASDAQ 100 ETF
-    # 한국 지수 ETF
-    "069500.KS": date(2002, 10, 14),   # KODEX 200 (국내 최초 상장 ETF)
-    "102110.KS": date(2008, 4, 3),     # TIGER 200
-    "133690.KS": date(2010, 10, 18),   # TIGER 미국나스닥100 (환노출)
-    "229200.KS": date(2015, 10, 1),    # KODEX 코스닥150
-    "305720.KS": date(2018, 11, 23),   # KODEX 200TR (배당 재투자)
-    "360750.KS": date(2020, 8, 7),     # TIGER 미국S&P500 (환노출)
+    "439870.KS": date(2022, 8, 23),    # KODEX 국고채30년액티브
+    # 미국 지수 ETF
+    "VOO":       date(2010, 9, 7),     # Vanguard S&P 500 ETF
     "379800.KS": date(2021, 4, 9),     # KODEX 미국S&P500
+    "360750.KS": date(2020, 8, 7),     # TIGER 미국S&P500
+    "QQQM":      date(2020, 10, 13),   # Invesco NASDAQ 100 ETF
+    "379810.KS": date(2021, 4, 9),     # KODEX 미국나스닥100
+    "133690.KS": date(2010, 10, 18),   # TIGER 미국나스닥100
+    # 한국 지수 ETF
+    "102110.KS": date(2008, 4, 3),     # TIGER 200
+    # 대체·현금성, 벤치마크
+    "GLDM":      date(2018, 6, 25),    # SPDR Gold MiniShares Trust
+    "153130.KS": date(2012, 2, 22),    # KODEX 단기채권
+    "SPY":       date(1993, 1, 22),    # SPDR S&P 500 ETF Trust (벤치마크·RSI 신호)
 }
+
+
+def listing_tag(t: str) -> str:
+    """종목명 옆에 붙이는 ' (상장 yyyy-mm-dd)' 표기. 상장일이 등록되지 않은 종목(은대 등)은 빈 문자열."""
+    return f" (상장 {LISTING_DATES[t]:%Y-%m-%d})" if t in LISTING_DATES else ""
+
 
 US_EQUITY = {
     "VOO":       "Vanguard S&P 500",
@@ -727,6 +738,7 @@ def weight_table(params: dict, weights: dict[str, float], with_hedge: bool = Tru
             "자산군": CLASS_LABEL[k],
             "종목": t.replace(".KS", ""),
             "종목명": ALL_NAMES.get(t, t),
+            "상장일": f"{LISTING_DATES[t]:%Y-%m-%d}" if t in LISTING_DATES else "-",
             "자산군 내 비중(%)": round(w / cls_tot[k] * 100, 2) if cls_tot[k] > 0 else 0.0,
             "포트폴리오 비중(%)": round(w * 100, 2),
             "_o": (order[k], -w),
@@ -1320,7 +1332,7 @@ def render_split_inputs(cls: str, tickers: list[str], class_w: float) -> dict[st
     for t in tickers:
         code = t.replace(".KS", "")
         vals[t] = float(st.number_input(
-            f"{code} · {ALL_NAMES.get(t, t).split(' (')[0]} (자산군 내 %)",
+            f"{code} · {ALL_NAMES.get(t, t).split(' (')[0]}{listing_tag(t)} — 자산군 내 %",
             min_value=0.0, max_value=100.0, step=5.0, format="%.1f", key=f"split_{cls}_{t}",
         ))
     tot = sum(vals.values())
@@ -1423,7 +1435,7 @@ def render_sidebar() -> tuple[dict, bool]:
                 "미국 국채", list(US_BOND.keys()), default=["IEF", "TLT"],
                 format_func=lambda x: (
                     f"{x.replace('.KS','')} - {US_BOND[x]}"
-                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                    + listing_tag(x)
                 ),
                 label_visibility="collapsed",
             )
@@ -1433,7 +1445,7 @@ def render_sidebar() -> tuple[dict, bool]:
                 "한국 국고채", list(KR_BOND.keys()), default=["471230.KS"],
                 format_func=lambda x: (
                     f"{x.replace('.KS','')} - {KR_BOND[x]}"
-                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                    + listing_tag(x)
                 ),
                 label_visibility="collapsed",
             )
@@ -1444,7 +1456,7 @@ def render_sidebar() -> tuple[dict, bool]:
                 "미국 지수 ETF", list(US_EQUITY.keys()), default=["VOO"],
                 format_func=lambda x: (
                     f"{x.replace('.KS','')} - {US_EQUITY[x]}"
-                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                    + listing_tag(x)
                 ),
                 label_visibility="collapsed",
             )
@@ -1454,18 +1466,18 @@ def render_sidebar() -> tuple[dict, bool]:
                 "한국 지수 ETF", list(KR_EQUITY.keys()), default=["102110.KS"],
                 format_func=lambda x: (
                     f"{x.replace('.KS','')} - {KR_EQUITY[x]}"
-                    + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
+                    + listing_tag(x)
                 ),
                 label_visibility="collapsed",
             )
 
         # ── 3. 대체 및 현금성 자산 ──
         with st.expander("🏆 대체·현금성 자산", expanded=False):
-            gold_on = st.toggle("Gold (GLDM) 편입", value=False)
+            gold_on = st.toggle(f"Gold (GLDM) 편입{listing_tag('GLDM')}", value=False)
             cash_ticker = st.selectbox(
                 "현금성 자산 선택", list(CASH_OPTS.keys()),
                 format_func=lambda x: (
-                    f"{x.replace('.KS','')} - {CASH_OPTS[x]}"
+                    f"{x.replace('.KS','')} - {CASH_OPTS[x]}{listing_tag(x)}"
                     if x != "BANK_DEPOSIT" else CASH_OPTS[x]
                 ),
             )
@@ -2027,7 +2039,7 @@ def contribution_by_class_table(ad: pd.DataFrame) -> pd.DataFrame:
         cls_total = float(g["합계 기여(%p)"].sum())
         for _, r in g.iterrows():
             rows.append({
-                "자산군": cls, "종목": r["종목코드"], "종목명": r["종목명"],
+                "자산군": cls, "종목": r["종목코드"], "종목명": r["종목명"] + r.get("_tag", ""),
                 "평균 비중(%)": r["평균 비중(%)"],
                 "상장통화 총수익률(%)": r["상장통화 총수익률(%)"],
                 **{c: r[c] for c in CONTRIB_COLS},
@@ -2082,7 +2094,8 @@ def render_asset_contribution(res: dict, unit_txt: str):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    tbl = contribution_by_class_table(ad)
+    code_to_t = {t.replace(".KS", ""): t for t in LISTING_DATES}
+    tbl = contribution_by_class_table(ad.assign(_tag=ad["종목코드"].map(lambda c: listing_tag(code_to_t.get(c, c)))))
     num_cols = ["평균 비중(%)", "상장통화 총수익률(%)", *CONTRIB_COLS, "자산군 내 기여 비중(%)"]
     st.dataframe(
         tbl.style.format({c: "{:+.2f}" if "기여(%p)" in c else "{:.2f}" for c in num_cols}, na_rep="-")
