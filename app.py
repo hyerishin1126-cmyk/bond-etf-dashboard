@@ -2,10 +2,11 @@
 국채·지수 ETF 혼합형 펀드 백테스팅 대시보드
 =====================================================
 - 투자대상:
-    1) 미국 국고채 ETF (SGOV, SHY, IEI, IEF, TLT, GOVT)
-    2) 한국 국고채 ETF (KODEX 3년, KODEX 10년액티브, KODEX 30년액티브, KOSEF 10년)
-    3) 미국 지수 ETF (SPY, VOO, IVV, QQQ, QQQM, DIA)
-    4) 한국 지수 ETF (KODEX 200, TIGER 200, KODEX 코스닥150, KODEX 200TR, TIGER 미국S&P500, TIGER 미국나스닥100)
+    1) 미국 국채 ETF: 미국 상장(SGOV, SHY, IEI, IEF, TLT) + 국내상장 환노출(0046A0, 329750, 0085P0, 476760)
+       + 국내상장 환헤지(H)(0091C0, 453850, 484790)
+    2) 한국 국고채 ETF (KODEX 국고채3년, 국고채10년액티브, 국고채30년액티브)
+    3) 미국 지수 ETF: 미국 상장(VOO, QQQM) + 국내상장 환노출(379800, 360750, 379810, 133690)
+    4) 한국 지수 ETF (TIGER 200)
     5) 대체 및 현금성 자산 (Gold GLDM, KODEX 단기채권, 은대 2.53%)
 - 기간 조회:
     - 날짜는 2000-01-01부터 전체 구간 선택 가능
@@ -107,19 +108,24 @@ CUSTOM_CSS = """
 #  TICKER UNIVERSE (국내외 국채 & 국내외 지수 ETF)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 US_BOND = {
-    "SGOV": "iShares 0-3M Treasury Bond (초단기)",
-    "SHY":  "iShares 1-3Y Treasury Bond (단기 1-3년)",
-    "IEI":  "iShares 3-7Y Treasury Bond (중기 3-7년)",
-    "IEF":  "iShares 7-10Y Treasury Bond (중장기 7-10년)",
-    "TLT":  "iShares 20+Y Treasury Bond (초장기 20년+)",
-    "GOVT": "iShares U.S. Treasury Bond ETF (국채종합)",
+    "SGOV":      "iShares 0-3M Treasury Bond",
+    "0046A0.KS": "TIGER 미국초단기(3개월이하)국채",
+    "329750.KS": "TIGER 미국달러단기채권액티브",
+    "SHY":       "iShares 1-3Y Treasury Bond",
+    "IEI":       "iShares 3-7Y Treasury Bond",
+    "IEF":       "iShares 7-10Y Treasury Bond",
+    "0085P0.KS": "ACE 미국10년국채액티브",
+    "0091C0.KS": "KODEX 미국10년국채액티브(H)",
+    "TLT":       "iShares 20+Y Treasury Bond",
+    "476760.KS": "ACE 미국30년국채액티브",
+    "453850.KS": "ACE 미국30년국채액티브(H)",
+    "484790.KS": "KODEX 미국30년국채액티브(H)",
 }
 
 KR_BOND = {
     "114260.KS": "KODEX 국고채3년",
     "471230.KS": "KODEX 국고채10년액티브",
     "439870.KS": "KODEX 국고채30년액티브",
-    "148070.KS": "KOSEF 국고채10년",
 }
 
 # 공식 상장일 (조회 시작일 보정·팝업 안내에 사용).
@@ -150,26 +156,20 @@ LISTING_DATES: dict[str, date] = {
     "229200.KS": date(2015, 10, 1),    # KODEX 코스닥150
     "305720.KS": date(2018, 11, 23),   # KODEX 200TR (배당 재투자)
     "360750.KS": date(2020, 8, 7),     # TIGER 미국S&P500 (환노출)
-    "379800.KS": date(2021, 4, 9),     # KODEX 미국S&P500TR (배당 재투자)
+    "379800.KS": date(2021, 4, 9),     # KODEX 미국S&P500
 }
 
 US_EQUITY = {
-    "SPY":  "SPDR S&P 500 Trust (대표 S&P 500)",
-    "VOO":  "Vanguard S&P 500 ETF",
-    "IVV":  "iShares Core S&P 500 ETF",
-    "QQQ":  "Invesco QQQ Trust (NASDAQ 100)",
-    "QQQM": "Invesco NASDAQ 100 ETF",
-    "DIA":  "SPDR Dow Jones Industrial Average",
+    "VOO":       "Vanguard S&P 500",
+    "379800.KS": "KODEX 미국S&P500",
+    "360750.KS": "TIGER 미국S&P500",
+    "QQQM":      "Invesco NASDAQ 100",
+    "379810.KS": "KODEX 미국나스닥100",
+    "133690.KS": "TIGER 미국나스닥100",
 }
 
 KR_EQUITY = {
-    "069500.KS": "KODEX 200 (한국 코스피200 대표)",
-    "102110.KS": "TIGER 200 (코스피200)",
-    "229200.KS": "KODEX 코스닥150 (코스닥 대표)",
-    "305720.KS": "KODEX 200TR (배당재투자형)",
-    "360750.KS": "TIGER 미국S&P500 (국내상장 환노출)",
-    "133690.KS": "TIGER 미국나스닥100 (국내상장 환노출)",
-    "379800.KS": "KODEX 미국S&P500TR (국내상장)",
+    "102110.KS": "TIGER 200",
 }
 
 CASH_OPTS = {
@@ -178,10 +178,30 @@ CASH_OPTS = {
 }
 
 # 국내상장이지만 기초자산이 달러 자산이라 원화 가격에 환율 효과가 섞여 있는 ETF
-KR_LISTED_US_FX = {"360750.KS", "133690.KS", "379800.KS"}
+KR_LISTED_US_FX = {
+    "0046A0.KS", "329750.KS", "0085P0.KS", "476760.KS",        # 미국 국채 (환노출)
+    "379800.KS", "360750.KS", "379810.KS", "133690.KS",        # 미국 지수 (환노출)
+}
+# 국내상장 환헤지형(H): 상품 안에서 이미 헤지되어 원화 가격에 환율 효과가 없음 (헤지 비용은 가격에 반영)
+KR_LISTED_HEDGED = {"0091C0.KS", "453850.KS", "484790.KS"}
+
+
+def is_usd_listed(t: str) -> bool:
+    """미국 상장(달러 표시) 종목 여부. 환헤지 슬라이더는 이 종목에만 적용된다."""
+    return t != "BANK_DEPOSIT" and not (t.endswith(".KS") or t.endswith(".KQ"))
+
+
+def fx_type_label(t: str) -> str:
+    if t in KR_LISTED_HEDGED:
+        return "국내상장 환헤지(H)"
+    if t in KR_LISTED_US_FX:
+        return "국내상장 환노출"
+    if is_usd_listed(t):
+        return "미국 상장(달러)"
+    return "원화 자산"
 
 ALL_NAMES = {**US_BOND, **KR_BOND, **US_EQUITY, **KR_EQUITY, **CASH_OPTS,
-             "GLDM": "SPDR Gold MiniShares", "SPY": US_EQUITY["SPY"]}
+             "GLDM": "SPDR Gold MiniShares", "SPY": "SPDR S&P 500 Trust"}
 
 # ── 분석 기간 ──
 # 날짜 선택은 전체 구간을 허용하고, 실제 조회 시작일은 '선택 종목 중 가장 늦게 상장한 종목'의
@@ -626,6 +646,8 @@ def class_split(params: dict, cls: str, tickers: list[str]) -> dict[str, float]:
 def hedge_ratio_for(params: dict, t: str) -> float | None:
     """종목별 환헤지 비율(0~1). 미국 국고채·미국 지수 ETF만 헤지, 금(GLDM)은 환오픈, 원화 자산은 None."""
     legacy = params.get("hedge_ratio", 0)          # 구버전 단일 헤지 비율 호환
+    if not is_usd_listed(t):
+        return None                                # 국내상장 종목은 슬라이더 헤지 대상 아님
     if t in params.get("us_bonds", []):
         return params.get("hedge_us_bond", legacy) / 100.0
     if t in params.get("us_equity", []):
@@ -711,7 +733,14 @@ def weight_table(params: dict, weights: dict[str, float], with_hedge: bool = Tru
         }
         if with_hedge:
             h = hedge_ratio_for(params, t)
-            row["환헤지(%)"] = "-" if h is None else ("환오픈" if t == "GLDM" else f"{h * 100:.0f}%")
+            if h is not None:
+                row["환헤지(%)"] = "환오픈" if t == "GLDM" else f"{h * 100:.0f}%"
+            elif t in KR_LISTED_HEDGED:
+                row["환헤지(%)"] = "상품 자체 헤지(H)"
+            elif t in KR_LISTED_US_FX:
+                row["환헤지(%)"] = "환노출(헤지 불가)"
+            else:
+                row["환헤지(%)"] = "-"
         rows.append(row)
     df = pd.DataFrame(rows)
     if df.empty:
@@ -740,7 +769,7 @@ def run_backtest(params: dict) -> dict | None:
         st.error("❌ 비중이 0%보다 큰 자산군에서 최소 하나의 종목을 선택하세요.")
         return None
 
-    us_set = set(params["us_bonds"]) | set(params["us_equity"]) | {"GLDM"}
+    us_set = {t for t in list(group) + ["GLDM"] if is_usd_listed(t)}     # 미국 상장(달러 표시) 종목
     market_tk = [t for t in group if t != "BANK_DEPOSIT"]
 
     # ── 1. 시세 + 분배금 수집 (⑥ 총수익 직접 산출) ──
@@ -776,7 +805,7 @@ def run_backtest(params: dict) -> dict | None:
         data_first = raw[t].index[0]
         listed = pd.Timestamp(LISTING_DATES[t]) if t in LISTING_DATES else data_first
         listing_info[t] = (listed, data_first, max(listed, data_first))
-    if any(t in us_set for t in avail_mkt) and not fx_df.empty:
+    if any(t in us_set or t in KR_LISTED_US_FX for t in avail_mkt) and not fx_df.empty:
         fx_first = fx_df.index[0]
         listing_info["KRW=X"] = (fx_first, fx_first, fx_first)
 
@@ -1059,6 +1088,7 @@ def run_backtest(params: dict) -> dict | None:
             "종목명": ALL_NAMES.get(t, t),
             "자산군": CLASS_LABEL[ticker_class(params, t)],
             "상장통화": "USD" if t in us_set else "KRW",
+            "환 유형": fx_type_label(t),
             "환헤지 비율(%)": None if hedge_ratio_for(params, t) is None else round(hedge_ratio_for(params, t) * 100, 1),
             "평균 비중(%)": round(float(w_j.mean()) * 100, 4),
             "상장통화 총수익률(%)": round(ret_listing, 4),
@@ -1388,11 +1418,11 @@ def render_sidebar() -> tuple[dict, bool]:
 
         # ── 2. 투자대상 선택 (채권 & 지수 ETF) ──
         with st.expander("🏛️ 국고채 ETF 유니버스", expanded=True):
-            st.caption("🇺🇸 **미국 국고채 ETF**")
+            st.caption("🇺🇸 **미국 국채 ETF** (미국 상장 + 국내상장, (H)=환헤지형)")
             us_bonds = st.multiselect(
                 "미국 국채", list(US_BOND.keys()), default=["IEF", "TLT"],
                 format_func=lambda x: (
-                    f"{x} - {US_BOND[x]}"
+                    f"{x.replace('.KS','')} - {US_BOND[x]}"
                     + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
                 ),
                 label_visibility="collapsed",
@@ -1411,17 +1441,17 @@ def render_sidebar() -> tuple[dict, bool]:
         with st.expander("📈 지수 ETF 유니버스 (미국·한국)", expanded=True):
             st.caption("🇺🇸 **미국 지수 ETF** (S&P500 / NASDAQ100)")
             us_equity = st.multiselect(
-                "미국 지수 ETF", list(US_EQUITY.keys()), default=["SPY"],
+                "미국 지수 ETF", list(US_EQUITY.keys()), default=["VOO"],
                 format_func=lambda x: (
-                    f"{x} - {US_EQUITY[x]}"
+                    f"{x.replace('.KS','')} - {US_EQUITY[x]}"
                     + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
                 ),
                 label_visibility="collapsed",
             )
 
-            st.caption("🇰🇷 **한국 지수 ETF** (코스피200 / 코스닥150 / 국내상장 미국지수)")
+            st.caption("🇰🇷 **한국 지수 ETF** (코스피200)")
             kr_equity = st.multiselect(
-                "한국 지수 ETF", list(KR_EQUITY.keys()), default=["069500.KS"],
+                "한국 지수 ETF", list(KR_EQUITY.keys()), default=["102110.KS"],
                 format_func=lambda x: (
                     f"{x.replace('.KS','')} - {KR_EQUITY[x]}"
                     + (f" (상장 {LISTING_DATES[x]:%Y-%m-%d})" if x in LISTING_DATES else "")
@@ -1519,31 +1549,36 @@ def render_sidebar() -> tuple[dict, bool]:
         # ── 7. 환율 및 통화 비교 제어 ──
         with st.expander("💱 환율 및 통화 비교 제어", expanded=True):
             st.caption("기본값: **환오픈 (USD 노출)** - 연평균 3% 이상 원화 약세/달러 강세 기대 반영")
-            st.caption("헤지 비율은 **각 자산군 편입분에 대한 비율**입니다. "
-                       "(예: 미국 국고채 50% 편입 + 헤지 30% → 포트폴리오의 15%를 헤지)")
+            st.caption("헤지 비율은 각 자산군의 **미국 상장(달러) 종목 편입분**에 대한 비율입니다. "
+                       "(예: 미국 상장 국채 50% 편입 + 헤지 30% → 포트폴리오의 15%를 헤지)")
             hedge_us_bond = st.slider(
-                "🇺🇸 미국 국고채 환헤지 (%)", 0, 100, 0, 5, key="hedge_us_bond",
-                help="미국 국고채 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
+                "🇺🇸 미국 국채 환헤지 (%)", 0, 100, 0, 5, key="hedge_us_bond",
+                help="미국 상장 국채 ETF(SGOV·SHY·IEI·IEF·TLT) 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
             )
             hedge_us_eq = st.slider(
                 "🇺🇸 미국 지수 ETF 환헤지 (%)", 0, 100, 0, 5, key="hedge_us_eq",
-                help="미국 지수 ETF 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
+                help="미국 상장 지수 ETF(VOO·QQQM) 편입분 중 환헤지하는 비율. 0% = 환오픈, 100% = 완전 헤지",
             )
             if preview_w:
-                cls_w = {k: sum(w for t, w in preview_w.items() if ticker_class(preview_params, t) == k)
-                         for k in ("us_bond", "us_eq")}
-                hedged_b = cls_w["us_bond"] * hedge_us_bond
-                hedged_e = cls_w["us_eq"] * hedge_us_eq
+                def _w(cls_key, cond):
+                    return sum(w for t, w in preview_w.items()
+                               if ticker_class(preview_params, t) == cls_key and cond(t)) * 100
+                usd_b, usd_e = _w("us_bond", is_usd_listed), _w("us_eq", is_usd_listed)
+                hedged_b, hedged_e = usd_b * hedge_us_bond / 100, usd_e * hedge_us_eq / 100
                 gold_w = preview_w.get("GLDM", 0.0) * 100
-                usd_total = cls_w["us_bond"] * 100 + cls_w["us_eq"] * 100 + gold_w
+                kr_open = sum(w for t, w in preview_w.items() if t in KR_LISTED_US_FX) * 100
+                kr_h = sum(w for t, w in preview_w.items() if t in KR_LISTED_HEDGED) * 100
+                open_total = (usd_b - hedged_b) + (usd_e - hedged_e) + gold_w + kr_open
                 st.caption(
-                    f"미국 국고채 {cls_w['us_bond'] * 100:.1f}% × {hedge_us_bond}% = **{hedged_b:.1f}%** 헤지  \n"
-                    f"미국 지수 ETF {cls_w['us_eq'] * 100:.1f}% × {hedge_us_eq}% = **{hedged_e:.1f}%** 헤지  \n"
+                    f"미국 상장 국채 {usd_b:.1f}% × {hedge_us_bond}% = **{hedged_b:.1f}%** 헤지  \n"
+                    f"미국 상장 지수 {usd_e:.1f}% × {hedge_us_eq}% = **{hedged_e:.1f}%** 헤지  \n"
                     + (f"금(GLDM) {gold_w:.1f}% = 환오픈  \n" if gold_w > 0 else "")
-                    + f"→ 달러 자산 {usd_total:.1f}% 중 헤지 {hedged_b + hedged_e:.1f}%, "
-                      f"환노출 {usd_total - hedged_b - hedged_e:.1f}% (포트폴리오 기준)"
+                    + (f"국내상장 환노출 ETF {kr_open:.1f}% = 환노출 (헤지 불가)  \n" if kr_open > 0 else "")
+                    + (f"국내상장 (H) ETF {kr_h:.1f}% = 상품 자체 헤지  \n" if kr_h > 0 else "")
+                    + f"→ 포트폴리오 기준 달러 환노출 **{open_total:.1f}%**, "
+                      f"헤지 {hedged_b + hedged_e + kr_h:.1f}% (슬라이더 {hedged_b + hedged_e:.1f}% + (H) {kr_h:.1f}%)"
                 )
-            st.caption("국내상장 환노출 ETF(TIGER 미국S&P500 등)는 원화 상품이라 이 헤지 대상이 아닙니다.")
+            st.caption("국내상장 종목은 슬라이더 대상이 아닙니다. 환노출형은 그대로 환노출, (H)형은 상품 안에서 이미 헤지됩니다.")
             show_hedged = st.checkbox("환헤지(USD) 수익률 비교 라인 표시", value=True)
 
             st.markdown("**헤지 비용(금리차) 산출**")
@@ -1734,7 +1769,8 @@ EXPORT_ASSUMPTIONS = [
     "한국 종목이 있으면 한국 영업일 기준 캘린더를 사용하고, 미국 종목은 직전 미국 종가를 사용 (날짜 시차 존재).",
     "환율은 Yahoo Finance KRW=X 사용. 미국 상장 자산의 원화 수익률 = (1+현지수익률)(1+환율변동) − 1 − 헤지비율×(환율변동 − 금리차). 헤지비율은 미국 국고채·미국 지수 ETF에 각각 따로 적용하고, 금(GLDM)은 환오픈.",
     "헤지 손익(금리차)은 전 영업일의 (원화 단기금리 − 달러 단기금리) × 경과일/365로 근사. 원화 금리는 FRED 월평균 자료.",
-    "국내상장 환노출 ETF(360750, 133690, 379800)는 원화 가격에서 환율 효과를 분리해 지수 기여와 환차익 기여로 나눔.",
+    "국내상장 환노출 ETF(종목별 상세의 '환 유형' 참고)는 원화 가격에서 환율 효과를 분리해 현지수익 기여와 환차익 기여로 나눔. 미국 종가와 한국 종가의 시차 때문에 일별 분해에는 오차가 있음.",
+    "국내상장 환헤지형(H) ETF는 원화 자산처럼 처리함: 헤지 비용이 이미 가격에 들어 있어 환차익·헤지손익 기여는 0으로 표시되고 전부 현지수익에 포함됨. 환헤지 슬라이더는 미국 상장 종목에만 적용.",
     "공모주 Alpha는 사용자가 입력한 연간 가정치를 달력일 기준으로 일할 가산한 값 (실제 공모주 성과 아님).",
     "은대(BANK_DEPOSIT)는 연 2.53% 고정 금리를 달력일 기준(ACT/365)으로 일할한 합성 자산.",
     "샤프 지수의 무위험수익률은 연 3% 고정.",
