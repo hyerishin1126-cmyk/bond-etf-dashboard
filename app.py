@@ -2,7 +2,7 @@
 국채·지수 ETF 혼합형 펀드 백테스팅 대시보드
 =====================================================
 - 투자대상:
-    1) 미국 국채 ETF: 미국 상장(SGOV, SHY, IEI, IEF, TLT) + 국내상장 환노출(0046A0, 329750, 0085P0, 476760)
+    1) 미국 국채 ETF: 미국 상장(SGOV, SHY, IEI, IEF, TLT) + 국내상장 환노출(0046A0, 329750, 308620, 0085P0, 476760)
        + 국내상장 환헤지(H)(0091C0, 453850, 484790)
     2) 한국 국고채 ETF (KODEX 국고채3년, 국고채10년액티브, 국고채30년액티브)
     3) 미국 지수 ETF: 미국 상장(VOO, QQQM) + 국내상장 환노출(379800, 360750, 379810, 133690)
@@ -114,6 +114,7 @@ US_BOND = {
     "SHY":       "iShares 1-3Y Treasury Bond",
     "IEI":       "iShares 3-7Y Treasury Bond",
     "IEF":       "iShares 7-10Y Treasury Bond",
+    "308620.KS": "KODEX 미국10년국채선물",
     "0085P0.KS": "ACE 미국10년국채액티브",
     "0091C0.KS": "KODEX 미국10년국채액티브(H)",
     "TLT":       "iShares 20+Y Treasury Bond",
@@ -139,6 +140,7 @@ LISTING_DATES: dict[str, date] = {
     "SHY":       date(2002, 7, 22),    # iShares 1-3 Year Treasury Bond ETF
     "IEI":       date(2007, 1, 5),     # iShares 3-7 Year Treasury Bond ETF
     "IEF":       date(2002, 7, 22),    # iShares 7-10 Year Treasury Bond ETF
+    "308620.KS": date(2018, 10, 19),   # KODEX 미국10년국채선물
     "0085P0.KS": date(2025, 7, 22),    # ACE 미국10년국채액티브
     "0091C0.KS": date(2025, 8, 19),    # KODEX 미국10년국채액티브(H)
     "TLT":       date(2002, 7, 22),    # iShares 20+ Year Treasury Bond ETF
@@ -190,7 +192,7 @@ CASH_OPTS = {
 
 # 국내상장이지만 기초자산이 달러 자산이라 원화 가격에 환율 효과가 섞여 있는 ETF
 KR_LISTED_US_FX = {
-    "0046A0.KS", "329750.KS", "0085P0.KS", "476760.KS",        # 미국 국채 (환노출)
+    "0046A0.KS", "329750.KS", "308620.KS", "0085P0.KS", "476760.KS",   # 미국 국채 (환노출)
     "379800.KS", "360750.KS", "379810.KS", "133690.KS",        # 미국 지수 (환노출)
 }
 # 국내상장 환헤지형(H): 상품 안에서 이미 헤지되어 원화 가격에 환율 효과가 없음 (헤지 비용은 가격에 반영)
